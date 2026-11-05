@@ -45,6 +45,12 @@ AuthRepository authRepository(Ref ref) {
   );
 
   registerOn401RefreshCallback(() async {
+    // Local builds have no account server: a 401 can only come from an
+    // endpoint this build should not be calling. Refreshing would fail and
+    // invalidating AuthCtrl would drop the synthetic profile, rebuild the
+    // session database and re-run every provider — an endless loop. Nothing
+    // to refresh, so report failure without touching auth state.
+    if (kLocalOnlyBuild) return false;
     final ok = await repo.refreshSession();
     if (!ok) {
       final hasToken = await repo.hasAccessToken();

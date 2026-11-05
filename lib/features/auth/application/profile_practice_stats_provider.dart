@@ -3,6 +3,7 @@ library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:enjoy_player/core/release/app_variant.dart';
 import 'package:enjoy_player/core/riverpod/async_value_x.dart';
 import 'package:enjoy_player/core/utils/client_timezone.dart';
 import 'package:enjoy_player/data/api/services/api_providers.dart';
@@ -12,6 +13,9 @@ import 'package:enjoy_player/features/library/domain/learning_statistics.dart';
 
 final profilePracticeStatsProvider =
     FutureProvider.autoDispose<LearningStatistics>((ref) async {
+      if (kLocalOnlyBuild) {
+        throw StateError('Profile stats are server-side; unavailable offline');
+      }
       final auth = ref.watch(authCtrlProvider).valueOrNull;
       if (auth is! AuthSignedIn) {
         throw StateError('Profile stats require a signed-in session');

@@ -2,12 +2,12 @@
   "version": "1.0.1",
   "build": 2,
   "minSupportedVersion": "1.0.0",
-  "notes": "（临时）更新检测验证",
+  "notes": "修复本地模式下的 401 重试循环；云端接口在离线模式直接返回空值。",
   "assets": {
     "android_arm64_v8a": {
-      "url": "https://github.com/johnson020202/enjoy-movie-english/releases/download/v1.0.0/EnjoyMovieEnglish-1.0.0-arm64-v8a.apk",
-      "sha256": "9f392b6fed1d58ea9e23682de91eefb8789c75faf9ecc81a7cb62b48d9fa81ab",
-      "file": "EnjoyMovieEnglish-1.0.0-arm64-v8a.apk"
+      "url": "https://github.com/johnson020202/enjoy-movie-english/releases/download/v1.0.1/EnjoyMovieEnglish-1.0.1-arm64-v8a.apk",
+      "sha256": "79ff00bdb5bcc0399a727725d87b52ba754fc244c3c163ef8b29288f662d05c7",
+      "file": "EnjoyMovieEnglish-1.0.1-arm64-v8a.apk"
     }
   }
 }
