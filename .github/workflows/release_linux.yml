@@ -1,0 +1,98 @@
+name: Release Linux
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload AppImage + update feeds on dl.enjoy.bot
+        type: boolean
+        default: false
+      publish_github:
+        description: Upload binaries to the GitHub Release for this tag (draft; finalize via release_publish.yml)
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Linux release
+    runs-on: [self-hosted, Linux, ci]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Ensure Linux tooling
+        run: bash .github/scripts/ensure_linux_tooling.sh
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Build Linux release
+        env:
+          # Forwarded to flutter build as --dart-define (analytics_config.dart).
+          # Unset ⇒ binary ships analytics-inert.
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+        run: bash .github/scripts/release_linux.sh
+
+      - name: Ensure publish tooling
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish)
+        run: bash .github/scripts/ensure_publish_tooling.sh
+
+      - name: Publish Linux feeds
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL_S3: ${{ secrets.AWS_ENDPOINT_URL_S3 }}
+          PUBLISH_BUCKET: ${{ secrets.PUBLISH_BUCKET }}
+          PUBLISH_PREFIX: player
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          RELEASE_REQUIRE_S3: "1"
+        run: bash .github/scripts/release_linux.sh --publish-only --publish
+
+      - name: Upload binaries to GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Enjoy Player ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # AppImage name format is enjoy-player-<semver>-x86_64.AppImage
+          # (see linux/packaging/make_appimage.sh); the version comes from
+          # pubspec.yaml, not the git tag, so it never has a leading 'v'.
+          files: build/linux/x64/release/enjoy-player-*-x86_64.AppImage
+
+      - name: Read pubspec version
+        id: read_version
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_github
+        shell: bash
+        run: echo "version=$(bash .github/scripts/read_pubspec_version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binaries to GitHub Release (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_github
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.read_version.outputs.version }}
+          name: Enjoy Player v${{ steps.read_version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: build/linux/x64/release/enjoy-player-*-x86_64.AppImage

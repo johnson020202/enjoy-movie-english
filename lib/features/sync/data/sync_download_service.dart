@@ -1,0 +1,247 @@
+/// Incremental downloads for the cloud metadata sync ([SyncEngine]).
+///
+/// Per-entity cursors go through the typed per-user [SettingsKeys] cursor
+/// keys (`settings_schema.dart`), so reset/read/advance below share one
+/// declaration per entity instead of raw string rows.
+library;
+
+import 'package:enjoy_player/core/json/json_cast.dart';
+import 'package:enjoy_player/core/logging/log.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/settings_keys.dart';
+import 'package:enjoy_player/data/api/services/audio_api.dart';
+import 'package:enjoy_player/data/api/services/recording_api.dart';
+import 'package:enjoy_player/data/api/services/video_api.dart';
+import 'package:enjoy_player/data/api/services/vocabulary_api.dart';
+import 'package:enjoy_player/features/sync/data/sync_page_upsert.dart';
+import 'package:enjoy_player/features/sync/data/sync_serializers.dart';
+import 'package:enjoy_player/features/sync/domain/sync_types.dart';
+
+final _log = logNamed('sync.download');
+
+/// Downloads server rows into local Drift tables (paged, cursor-based).
+///
+/// Accepted bypass of the MediaRegistry seam (issue #723): the generic
+/// `_downloadEntityInternal` loop is driven by per-table typed row
+/// constructors, DAO callbacks (`getManyByIds` bulk pre-read / `upsertRows`
+/// batch write / `getLocal` + `insertRow` per-row fallback / merge), and
+/// tombstone handlers, so routing its writes through the registry would
+/// just re-branch inside a generic that already knows its entity type.
+///
+/// Each page costs one `WHERE id IN (…)` read plus one transactional batch
+/// upsert (issue #810 D3) instead of two round trips and one commit per row.
+class SyncDownloadService {
+  SyncDownloadService({
+    required this._db,
+    required this._audioApi,
+    required this._videoApi,
+    required this._recordingApi,
+    required this._vocabularyApi,
+  });
+
+  final AppDatabase _db;
+  final AudioApi _audioApi;
+  final VideoApi _videoApi;
+  final RecordingApi _recordingApi;
+  final VocabularyApi _vocabularyApi;
+
+  bool _vocabCursorRepairDone = false;
+  static const _pageSize = 50;
+
+  Future<SyncResult> downloadAudios() =>
+      _downloadAudiosInternal(resetCursor: false);
+
+  Future<SyncResult> downloadVideos() =>
+      _downloadVideosInternal(resetCursor: false);
+
+  Future<SyncResult> downloadRecordings() =>
+      _downloadRecordingsInternal(resetCursor: false);
+
+  /// Word-book continuity (ADR-0054): unlike media, vocabulary pulls on
+  /// every signed-in sync rather than only via manual "Add to library".
+  Future<SyncResult> downloadVocabularyItems() async {
+    await _repairVocabularyCursorsOnce();
+    return _downloadVocabularyItemsInternal(resetCursor: false);
+  }
+
+  Future<SyncResult> downloadVocabularyContexts() async {
+    await _repairVocabularyCursorsOnce();
+    return _downloadVocabularyContextsInternal(resetCursor: false);
+  }
+
+  /// Vocabulary pulls shipped (v0.8.x–v0.9.0) advancing the `updatedAfter`
+  /// cursor even when every page row failed to merge — the server jsonb
+  /// `explanation` cast bug — leaving installs with an empty word book and a
+  /// cursor past the rows that never applied. Clears both vocabulary cursors
+  /// exactly once so the next pull re-fetches the full server word book.
+  Future<void> _repairVocabularyCursorsOnce() async {
+    if (_vocabCursorRepairDone) return;
+    final cleared = await _db.transaction(() async {
+      final repaired = await _db.settingsDao.readSetting(
+        SettingsKeys.syncVocabularyCursorRepairV1,
+      );
+      if (repaired != null) return false;
+      await _db.settingsDao.deleteSetting(
+        SettingsKeys.syncCursorVocabularyItem,
+      );
+      await _db.settingsDao.deleteSetting(
+        SettingsKeys.syncCursorVocabularyContext,
+      );
+      await _db.settingsDao.writeSetting(
+        SettingsKeys.syncVocabularyCursorRepairV1,
+        '1',
+      );
+      return true;
+    });
+    _vocabCursorRepairDone = true;
+    if (cleared) {
+      _log.info(
+        'vocabulary cursor repair v1: cursors cleared for full re-pull',
+      );
+    }
+  }
+
+  Future<SyncResult> _downloadAudiosInternal({required bool resetCursor}) {
+    return _downloadEntityInternal<AudioRow>(
+      resetCursor: resetCursor,
+      cursorKey: SettingsKeys.syncCursorAudio,
+      fetchPage: ({int? limit, String? updatedAfter}) async {
+        final raw = await _audioApi.audios(
+          limit: limit,
+          updatedAfter: updatedAfter,
+        );
+        return raw.map<Map<String, dynamic>>(castJsonObject).toList();
+      },
+      getManyByIds: _db.audioDao.getManyByIds,
+      getLocal: _db.audioDao.getById,
+      upsertRows: _db.audioDao.upsertRows,
+      insertRow: _db.audioDao.insertRow,
+      merge: mergeAudioLastWriteWins,
+    );
+  }
+
+  Future<SyncResult> _downloadVideosInternal({required bool resetCursor}) {
+    return _downloadEntityInternal<VideoRow>(
+      resetCursor: resetCursor,
+      cursorKey: SettingsKeys.syncCursorVideo,
+      fetchPage: ({int? limit, String? updatedAfter}) async {
+        final raw = await _videoApi.videos(
+          limit: limit,
+          updatedAfter: updatedAfter,
+        );
+        return raw.map<Map<String, dynamic>>(castJsonObject).toList();
+      },
+      getManyByIds: _db.videoDao.getManyByIds,
+      getLocal: _db.videoDao.getById,
+      upsertRows: _db.videoDao.upsertRows,
+      insertRow: _db.videoDao.insertRow,
+      merge: mergeVideoLastWriteWins,
+      onTombstone: (id) => _db.videoDao.deleteId(id),
+    );
+  }
+
+  Future<SyncResult> _downloadRecordingsInternal({required bool resetCursor}) {
+    return _downloadEntityInternal<RecordingRow>(
+      resetCursor: resetCursor,
+      cursorKey: SettingsKeys.syncCursorRecording,
+      fetchPage: ({int? limit, String? updatedAfter}) async {
+        final raw = await _recordingApi.recordings(
+          limit: limit,
+          updatedAfter: updatedAfter,
+        );
+        return raw.map<Map<String, dynamic>>(castJsonObject).toList();
+      },
+      getManyByIds: _db.recordingDao.getManyByIds,
+      getLocal: _db.recordingDao.getById,
+      upsertRows: _db.recordingDao.upsertRows,
+      insertRow: _db.recordingDao.insertRow,
+      merge: mergeRecordingLastWriteWins,
+    );
+  }
+
+  Future<SyncResult> _downloadVocabularyItemsInternal({
+    required bool resetCursor,
+  }) {
+    return _downloadEntityInternal<VocabularyItemRow>(
+      resetCursor: resetCursor,
+      cursorKey: SettingsKeys.syncCursorVocabularyItem,
+      fetchPage: ({int? limit, String? updatedAfter}) async {
+        final raw = await _vocabularyApi.vocabularyItems(
+          limit: limit,
+          updatedAfter: updatedAfter,
+        );
+        return raw.map<Map<String, dynamic>>(castJsonObject).toList();
+      },
+      getManyByIds: _db.vocabularyItemDao.getManyByIds,
+      getLocal: _db.vocabularyItemDao.getById,
+      upsertRows: _db.vocabularyItemDao.upsertRows,
+      insertRow: _db.vocabularyItemDao.updateRow,
+      merge: mergeVocabularyItemConflict,
+    );
+  }
+
+  Future<SyncResult> _downloadVocabularyContextsInternal({
+    required bool resetCursor,
+  }) {
+    return _downloadEntityInternal<VocabularyContextRow>(
+      resetCursor: resetCursor,
+      cursorKey: SettingsKeys.syncCursorVocabularyContext,
+      fetchPage: ({int? limit, String? updatedAfter}) async {
+        final raw = await _vocabularyApi.vocabularyContexts(
+          limit: limit,
+          updatedAfter: updatedAfter,
+        );
+        return raw.map<Map<String, dynamic>>(castJsonObject).toList();
+      },
+      getManyByIds: _db.vocabularyContextDao.getManyByIds,
+      getLocal: _db.vocabularyContextDao.getById,
+      upsertRows: _db.vocabularyContextDao.upsertRows,
+      insertRow: _db.vocabularyContextDao.updateRow,
+      merge: mergeVocabularyContextLastWriteWins,
+    );
+  }
+
+  Future<SyncResult> _downloadEntityInternal<E>({
+    required bool resetCursor,
+    required SettingKey<String?> cursorKey,
+    required Future<List<Map<String, dynamic>>> Function({
+      int? limit,
+      String? updatedAfter,
+    })
+    fetchPage,
+    required Future<Map<String, E>> Function(List<String> ids) getManyByIds,
+    required Future<E?> Function(String id) getLocal,
+    required Future<void> Function(List<E> rows) upsertRows,
+    required Future<void> Function(E row) insertRow,
+    required E Function({
+      required E? local,
+      required Map<String, dynamic> server,
+    })
+    merge,
+    Future<void> Function(String id)? onTombstone,
+  }) {
+    return downloadPagedEntities<E>(
+      settingsDao: _db.settingsDao,
+      cursorKey: cursorKey,
+      pageSize: _pageSize,
+      resetCursor: resetCursor,
+      fetchPage: fetchPage,
+      getManyByIds: getManyByIds,
+      getLocal: getLocal,
+      upsertRows: upsertRows,
+      insertRow: insertRow,
+      merge: merge,
+      onTombstone: onTombstone,
+      log: _log,
+    );
+  }
+
+  Future<SyncResult> downloadAllEntitiesFresh() async {
+    final a = await _downloadAudiosInternal(resetCursor: true);
+    final v = await _downloadVideosInternal(resetCursor: true);
+    final r = await _downloadRecordingsInternal(resetCursor: true);
+    final vi = await _downloadVocabularyItemsInternal(resetCursor: true);
+    final vc = await _downloadVocabularyContextsInternal(resetCursor: true);
+    return a.merge(v).merge(r).merge(vi).merge(vc);
+  }
+}

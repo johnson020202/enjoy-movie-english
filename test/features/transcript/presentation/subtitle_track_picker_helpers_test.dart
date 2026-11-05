@@ -1,0 +1,139 @@
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/features/transcript/domain/transcript_track.dart';
+import 'package:enjoy_player/features/transcript/presentation/subtitle_track_picker_helpers.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+TranscriptTrack _t({
+  String id = 'a',
+  String language = 'en',
+  String source = 'official',
+  String label = '',
+  int? trackIndex,
+  String targetType = 'Video',
+  String targetId = 'video-1',
+}) => TranscriptTrack(
+  id: id,
+  targetType: targetType,
+  targetId: targetId,
+  language: language,
+  source: source,
+  label: label,
+  trackIndex: trackIndex,
+);
+
+void main() {
+  group('constants + helpers', () {
+    test('kExpandedTrackListMaxHeight is 280 (matches design spec)', () {
+      expect(kExpandedTrackListMaxHeight, 280);
+    });
+
+    test('sheetHorizontalPadding = space16 + space4', () {
+      final t = EnjoyThemeTokens.build(const ColorScheme.light());
+      expect(sheetHorizontalPadding(t), t.space16 + t.space4);
+    });
+
+    test('trackOptionPadding returns a thin vertical-only edge inset', () {
+      final t = EnjoyThemeTokens.build(const ColorScheme.light());
+      final p = trackOptionPadding(t);
+      expect(p.start, 0);
+      expect(p.top, 2);
+      expect(p.end, 0);
+      expect(p.bottom, 2);
+    });
+  });
+
+  group('trackLabel', () {
+    test('returns the label when non-empty', () {
+      expect(trackLabel(_t(label: 'English (US)')), 'English (US)');
+    });
+
+    test('falls back to language when label is empty', () {
+      expect(trackLabel(_t(label: '', language: 'es')), 'es');
+    });
+  });
+
+  group('findTrack', () {
+    test('returns null when the id is null', () {
+      expect(findTrack([_t(id: 'a')], null), isNull);
+    });
+
+    test('returns the matching track', () {
+      final t1 = _t(id: 'a');
+      final t2 = _t(id: 'b');
+      expect(findTrack([t1, t2], 'b'), same(t2));
+    });
+
+    test('returns null when the track is not in the list', () {
+      expect(findTrack([_t(id: 'a')], 'missing'), isNull);
+    });
+  });
+
+  group('providerLabel', () {
+    test('returns the localized string for each known source', () {
+      final AppLocalizations l10n = _FakeL10n();
+      expect(providerLabel(l10n, 'official'), 'Official');
+      expect(providerLabel(l10n, 'auto'), 'Auto');
+      expect(providerLabel(l10n, 'ai'), 'AI');
+      expect(providerLabel(l10n, 'user'), 'User');
+    });
+
+    test('uppercases unknown source names', () {
+      final AppLocalizations l10n = _FakeL10n();
+      expect(providerLabel(l10n, 'experimental'), 'EXPERIMENTAL');
+      expect(providerLabel(l10n, ''), '');
+    });
+  });
+
+  group('providerBadgeColors', () {
+    ColorScheme scheme() => ColorScheme.fromSeed(seedColor: Colors.indigo);
+
+    for (final source in ['official', 'auto', 'ai', 'user', 'whatever']) {
+      test('$source → neutral sunk badge (Duet: no hue per provider)', () {
+        final cs = scheme();
+        expect(providerBadgeColors(cs, source).bg, cs.surfaceContainerHighest);
+        expect(providerBadgeColors(cs, source).fg, cs.onSurfaceVariant);
+      });
+    }
+  });
+
+  group('trackPickerRadioTheme', () {
+    testWidgets('returns a ThemeData with customised splash/highlight/hover', (
+      tester,
+    ) async {
+      late ThemeData built;
+      await tester.pumpWidget(
+        MaterialApp(
+          builder: (context, _) {
+            built = trackPickerRadioTheme(context);
+            return const SizedBox.shrink();
+          },
+          home: const SizedBox.shrink(),
+        ),
+      );
+      expect(built.colorScheme, isNotNull);
+      expect(built.splashColor, isNotNull);
+      expect(built.highlightColor, Colors.transparent);
+      expect(built.hoverColor, isNotNull);
+      expect(built.radioTheme, isNotNull);
+      expect(built.listTileTheme, isNotNull);
+    });
+  });
+}
+
+class _FakeL10n implements AppLocalizations {
+  @override
+  String get subtitlesProviderOfficial => 'Official';
+  @override
+  String get subtitlesProviderAuto => 'Auto';
+  @override
+  String get subtitlesProviderAi => 'AI';
+  @override
+  String get subtitlesProviderUser => 'User';
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) {
+    throw UnimplementedError('Stub missing for ${invocation.memberName}.');
+  }
+}

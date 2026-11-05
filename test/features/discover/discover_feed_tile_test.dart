@@ -1,0 +1,325 @@
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:drift/native.dart';
+import 'package:enjoy_player/core/ids/enjoy_ids.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/data/files/file_storage.dart';
+import 'package:enjoy_player/features/discover/application/discover_providers.dart';
+import 'package:enjoy_player/features/discover/data/discover_repository.dart';
+import 'package:enjoy_player/features/discover/domain/feed_entry.dart';
+import 'package:enjoy_player/features/discover/presentation/discover_feed_tile.dart';
+import 'package:enjoy_player/features/library/data/library_repository.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:go_router/go_router.dart';
+
+class _ThrowingLibraryRepository extends MediaLibraryRepository {
+  _ThrowingLibraryRepository(super.db, super.storage);
+
+  @override
+  Future<String> importYoutubeVideo(
+    String rawInput, {
+    String? prefetchedTitle,
+    String? prefetchedThumbnailUrl,
+    String contentLanguage = 'und',
+  }) async {
+    throw Exception('import failed');
+  }
+}
+
+void main() {
+  testWidgets('DiscoverFeedTile shows In library for imported video', (
+    tester,
+  ) async {
+    final db = AppDatabase(executor: NativeDatabase.memory());
+    addTearDown(db.close);
+
+    const videoId = 'dQw4w9WgXcQ';
+    final now = DateTime.now();
+    await db.videoDao.insertRow(
+      VideoRow(
+        id: enjoyVideoId(provider: 'youtube', vid: videoId),
+        vid: videoId,
+        provider: 'youtube',
+        title: 'Test',
+        durationSeconds: 0,
+        mediaUrl: 'https://www.youtube.com/watch?v=$videoId',
+        language: 'und',
+        createdAt: now,
+        updatedAt: now,
+      ),
+    );
+
+    final entry = FeedEntry(
+      videoId: videoId,
+      channelId: 'UCAuUUnT6oDeKwE6v1NGQxug',
+      title: 'Never Gonna Give You Up',
+      publishedAt: now,
+    );
+
+    final repo = DiscoverRepository(
+      db,
+      libraryRepository: MediaLibraryRepository(db, FileStorage()),
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appDatabaseProvider.overrideWithValue(db),
+          discoverRepositoryProvider.overrideWithValue(repo),
+        ],
+        child: MaterialApp(
+          localizationsDelegates: const [
+            AppLocalizations.delegate,
+            GlobalMaterialLocalizations.delegate,
+            GlobalWidgetsLocalizations.delegate,
+          ],
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: DiscoverFeedTile(
+              entry: entry,
+              inLibrary: true,
+              channelName: 'TED',
+              channelAvatarUrl: null,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.pumpAndSettle();
+
+    expect(find.byIcon(EnjoyIcons.check), findsOneWidget);
+    expect(find.text('In library'), findsOneWidget);
+  });
+
+  testWidgets(
+    'DiscoverFeedTile does not open player when import fails on play',
+    (tester) async {
+      final db = AppDatabase(executor: NativeDatabase.memory());
+      addTearDown(db.close);
+
+      const videoId = 'dQw4w9WgXcQ';
+      final now = DateTime.now();
+      await db.videoDao.insertRow(
+        VideoRow(
+          id: enjoyVideoId(provider: 'youtube', vid: videoId),
+          vid: videoId,
+          provider: 'youtube',
+          title: 'Test',
+          durationSeconds: 0,
+          mediaUrl: 'https://www.youtube.com/watch?v=$videoId',
+          language: 'und',
+          createdAt: now,
+          updatedAt: now,
+        ),
+      );
+
+      final entry = FeedEntry(
+        videoId: videoId,
+        channelId: 'UCAuUUnT6oDeKwE6v1NGQxug',
+        title: 'Never Gonna Give You Up',
+        publishedAt: now,
+      );
+
+      final repo = DiscoverRepository(
+        db,
+        libraryRepository: _ThrowingLibraryRepository(db, FileStorage()),
+      );
+
+      final router = GoRouter(
+        initialLocation: '/',
+        routes: [
+          GoRoute(
+            path: '/',
+            builder: (context, state) => Scaffold(
+              body: DiscoverFeedTile(
+                entry: entry,
+                inLibrary: false,
+                channelName: 'TED',
+                channelAvatarUrl: null,
+              ),
+            ),
+          ),
+          GoRoute(
+            path: '/player/:mediaId',
+            builder: (context, state) =>
+                const Scaffold(body: Text('player-open')),
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            appDatabaseProvider.overrideWithValue(db),
+            discoverRepositoryProvider.overrideWithValue(repo),
+          ],
+          child: MaterialApp.router(
+            routerConfig: router,
+            localizationsDelegates: const [
+              AppLocalizations.delegate,
+              GlobalMaterialLocalizations.delegate,
+              GlobalWidgetsLocalizations.delegate,
+            ],
+            supportedLocales: AppLocalizations.supportedLocales,
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      await db.delete(db.videos).go();
+
+      await tester.tap(find.byType(DiscoverFeedTile));
+      await tester.pumpAndSettle();
+
+      expect(find.text('player-open'), findsNothing);
+      expect(router.state.uri.path, '/');
+    },
+  );
+
+  testWidgets(
+    'long-title feed tile fits the shared meta budget in a narrow column',
+    (tester) async {
+      final db = AppDatabase(executor: NativeDatabase.memory());
+      addTearDown(db.close);
+
+      final now = DateTime.now();
+      final entry = FeedEntry(
+        videoId: 'longtitle',
+        channelId: 'UCAuUUnT6oDeKwE6v1NGQxug',
+        title:
+            'A discover feed entry title long enough to wrap onto two lines '
+            'inside a narrow grid column',
+        publishedAt: now,
+        durationSeconds: 1234,
+      );
+
+      final repo = DiscoverRepository(
+        db,
+        libraryRepository: MediaLibraryRepository(db, FileStorage()),
+      );
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            appDatabaseProvider.overrideWithValue(db),
+            discoverRepositoryProvider.overrideWithValue(repo),
+          ],
+          child: MaterialApp(
+            localizationsDelegates: const [
+              AppLocalizations.delegate,
+              GlobalMaterialLocalizations.delegate,
+              GlobalWidgetsLocalizations.delegate,
+            ],
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: 280,
+                  child: DiscoverFeedTile(
+                    entry: entry,
+                    inLibrary: false,
+                    channelName: 'TED',
+                    channelAvatarUrl: null,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getSize(find.byType(DiscoverFeedTile)).height,
+        lessThanOrEqualTo(157.5 + discoverFeedTileMetaHeight + 2),
+      );
+      expect(find.text('In library'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'two-line title at a larger platform text scale stays inside the slot',
+    (tester) async {
+      final db = AppDatabase(executor: NativeDatabase.memory());
+      addTearDown(db.close);
+
+      final now = DateTime.now();
+      final entry = FeedEntry(
+        videoId: 'scaled',
+        channelId: 'UCAuUUnT6oDeKwE6v1NGQxug',
+        title:
+            'The Right to Life, Liberty — and Free Time | Daniel Roberts | TED',
+        publishedAt: now,
+        durationSeconds: 1234,
+      );
+
+      final repo = DiscoverRepository(
+        db,
+        libraryRepository: MediaLibraryRepository(db, FileStorage()),
+      );
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            appDatabaseProvider.overrideWithValue(db),
+            discoverRepositoryProvider.overrideWithValue(repo),
+          ],
+          child: MaterialApp(
+            localizationsDelegates: const [
+              AppLocalizations.delegate,
+              GlobalMaterialLocalizations.delegate,
+              GlobalWidgetsLocalizations.delegate,
+            ],
+            supportedLocales: AppLocalizations.supportedLocales,
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: const TextScaler.linear(1.1)),
+              child: child!,
+            ),
+            home: Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: 320,
+                  child: DiscoverFeedTile(
+                    entry: entry,
+                    inLibrary: false,
+                    channelName: 'TED',
+                    channelAvatarUrl: null,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(
+        tester.getSize(find.byType(DiscoverFeedTile)).height,
+        lessThanOrEqualTo(180 + discoverFeedTileMetaHeight + 8),
+      );
+    },
+  );
+
+  test('grid cell is tall enough for the feed tile meta budget', () {
+    for (final tileWidth in <double>[280, 320, 400, 640]) {
+      final cellHeight =
+          tileWidth / discoverFeedTileGridAspectRatioForWidth(tileWidth);
+      expect(
+        cellHeight,
+        greaterThanOrEqualTo(tileWidth * 9 / 16 + discoverFeedTileMetaHeight),
+        reason: 'cell too short at tile width $tileWidth',
+      );
+    }
+  });
+}

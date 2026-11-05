@@ -1,0 +1,50 @@
+/// Drift table: bounded L2 cache for AI result payloads.
+///
+/// Schema is intentionally minimal — the cache layer (AiResultCache) does
+/// all eviction, indexing, and JSON serialization. The SQL layer just
+/// provides keyed storage + a (kind, updatedAt DESC) index for cheap
+/// LRU-eviction and age-cutoff queries.
+library;
+
+import 'package:drift/drift.dart';
+
+@TableIndex(name: 'idx_ai_cache_kind_updated_at', columns: {#kind, #updatedAt})
+@TableIndex(
+  name: 'idx_ai_cache_lang_pair',
+  columns: {#sourceLanguage, #targetLanguage},
+)
+@DataClassName('AiCacheRow')
+class AiCache extends Table {
+  @override
+  String get tableName => 'ai_cache';
+
+  /// Discriminator that prevents cross-modality collisions. One of
+  /// `AiKind.wire` (`translation`, `dictionary`, `contextual_translation`,
+  /// `auto_translate_line`).
+  TextColumn get kind => text()();
+
+  /// 32-char lowercase hex SHA-256 prefix produced by
+  /// `AiCacheFingerprint.fingerprint(...)`.
+  TextColumn get key => text()();
+
+  /// JSON-encoded result payload. Decoded back to the concrete Dart type
+  /// by the cache layer.
+  TextColumn get payloadJson => text()();
+
+  /// Last-write timestamp (milliseconds since epoch). Used by
+  /// `evictOldestExcept` and `pruneOlderThan`.
+  IntColumn get updatedAt => integer()();
+
+  /// Language pair the payload was produced for, projected out of the
+  /// payload at write time so `evictForPair` matches on indexed columns
+  /// instead of scanning `payload_json` with a leading-wildcard `LIKE`
+  /// (issue #827 C4). Rows without a pair in their payload stay null and
+  /// are never pair-evicted — same matching semantics as the old LIKE.
+  /// Declared last so fresh installs match the v19 → v20 `ALTER TABLE`
+  /// append order.
+  TextColumn get sourceLanguage => text().nullable()();
+  TextColumn get targetLanguage => text().nullable()();
+
+  @override
+  Set<Column<Object>> get primaryKey => {kind, key};
+}

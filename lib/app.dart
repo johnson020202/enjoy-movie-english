@@ -1,0 +1,318 @@
+/// Root Material app with router + theming.
+library;
+
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:enjoy_player/core/network/proxy/proxy_providers.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:logging/logging.dart';
+
+import 'package:enjoy_player/core/analytics/analytics_bootstrap.dart';
+import 'package:enjoy_player/core/application/app_preferences_provider.dart';
+import 'package:enjoy_player/core/layout/constrained_app_viewport.dart';
+import 'package:enjoy_player/core/logging/log.dart';
+import 'package:enjoy_player/core/recovery/recovery_actions.dart';
+import 'package:enjoy_player/core/recovery/recovery_surface.dart';
+import 'package:enjoy_player/core/riverpod/async_value_x.dart';
+import 'package:enjoy_player/core/window/desktop_window.dart';
+import 'package:enjoy_player/core/notices/app_notice.dart';
+import 'package:enjoy_player/core/routing/app_router.dart';
+import 'package:enjoy_player/core/theme/app_theme.dart';
+import 'package:enjoy_player/core/theme/widgets/skeleton.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/application/auth_deep_link_listener.dart';
+import 'package:enjoy_player/features/hotkeys/presentation/app_hotkeys_keyboard_listener.dart';
+import 'package:enjoy_player/features/update/presentation/update_prompt_host.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+/// Backs up + wipes the local database, then invalidates every DB-derived
+/// provider so the app recovers in place instead of leaving the user stuck
+/// on [RecoverySurface] until they manually relaunch.
+///
+/// A top-level function (taking [Ref] rather than being a method on
+/// [EnjoyApp]'s state) so it can be exercised directly against a plain
+/// [ProviderContainer] in tests — real `dart:io` file operations never
+/// resolve inside `testWidgets`' fake-async zone when driven through a
+/// tapped button's callback, so the meaningful test for this logic runs
+/// with a real event loop instead of pumped widget frames.
+Future<RecoveryResetOutcome> performRecoveryReset(Ref ref) async {
+  try {
+    await closeAndClearAllAppDatabases();
+  } on Object {} // ignore: empty_catches
+
+  final outcome = await resetLocalLibraryWithBackup();
+  if (outcome == RecoveryResetOutcome.success) {
+    ref.invalidate(deviceGlobalAppDatabaseProvider);
+    ref.invalidate(appDatabaseProvider);
+    ref.invalidate(appPreferencesCtrlProvider);
+  }
+  return outcome;
+}
+
+/// Wraps [performRecoveryReset] behind a provider so it can be invoked from
+/// a [WidgetRef] (`_errorMaterialApp`'s `onReset` callback) or a plain
+/// [ProviderContainer] (tests) alike — neither type implements [Ref]
+/// directly, but both support `read`/`invalidate` on a [ProviderListenable],
+/// which is all that's needed to reach the real [Ref] supplied internally.
+@visibleForTesting
+final recoveryResetResultProvider = FutureProvider<RecoveryResetOutcome>(
+  performRecoveryReset,
+);
+
+class EnjoyApp extends ConsumerStatefulWidget {
+  const EnjoyApp({super.key, @visibleForTesting this.themeBuilder});
+
+  /// When set (widget tests only), skips [buildAppTheme] / Google Fonts fetches.
+  @visibleForTesting
+  final ThemeData Function()? themeBuilder;
+
+  @override
+  ConsumerState<EnjoyApp> createState() => _EnjoyAppState();
+}
+
+class _EnjoyAppState extends ConsumerState<EnjoyApp>
+    with WidgetsBindingObserver {
+  /// Keeps locale/prefs visible while [appPreferencesCtrlProvider] reloads after
+  /// auth-scoped DB switches (signed-in), avoiding a full-app loading flash.
+  AppPreferencesState? _lastResolvedPrefs;
+
+  /// Logger for app-lifecycle shutdown.
+  static final Logger _log = logNamed('app-shutdown');
+
+  /// Shared by every [MaterialApp] instance built here — including the
+  /// loading/error fallbacks, which run before [appPreferencesCtrlProvider]
+  /// resolves a locale. Without these, `AppLocalizations.of(context)` (used
+  /// by e.g. [RecoverySurface]) returns null and crashes on the very screen
+  /// meant to explain a local-database problem to the user.
+  static const _fallbackLocalizationsDelegates = <LocalizationsDelegate>[
+    AppLocalizations.delegate,
+    GlobalMaterialLocalizations.delegate,
+    GlobalWidgetsLocalizations.delegate,
+    GlobalCupertinoLocalizations.delegate,
+  ];
+
+  /// Centralized MaterialApp/MaterialApp.router construction for every
+  /// branch of [build].
+  ///
+  /// The loading, error, and router branches all configure the same
+  /// fallback localization delegates, supported locales, scaffold
+  /// messenger key, and theme; only `home` (loading/error) vs
+  /// `routerConfig + locale` (router) differs. Routing all three through
+  /// this single factory makes the missing-delegates bug fixed in 8f7d301
+  /// [RecoverySurface] crashing on `AppLocalizations.of(context)` in the
+  /// loading/error fallbacks structurally impossible to reintroduce.
+  ///
+  /// Pass `router: null` to build a plain `MaterialApp` with [home];
+  /// pass a [GoRouter] to build a `MaterialApp.router` with the supplied
+  /// [prefs] as the locale source.
+  Widget _baseMaterialApp({
+    required ThemeData theme,
+    ThemeData? darkTheme,
+    ThemeMode themeMode = ThemeMode.system,
+    required Widget home,
+    GoRouter? router,
+    AppPreferencesState? prefs,
+  }) {
+    if (router != null) {
+      return MaterialApp.router(
+        debugShowCheckedModeBanner: false,
+        scaffoldMessengerKey: appScaffoldMessengerKey,
+        onGenerateTitle: (ctx) => AppLocalizations.of(ctx)!.appTitle,
+        theme: theme,
+        darkTheme: darkTheme ?? theme,
+        themeMode: themeMode,
+        locale: prefs?.locale,
+        localizationsDelegates: _fallbackLocalizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        routerConfig: router,
+        builder: _shellBuilder,
+      );
+    }
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: appScaffoldMessengerKey,
+      theme: theme,
+      darkTheme: darkTheme ?? theme,
+      themeMode: themeMode,
+      localizationsDelegates: _fallbackLocalizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: home,
+    );
+  }
+
+  /// Wraps the router-configured app in its system-chrome overlay,
+  /// deep-link listener, update prompt, and (on desktop) hotkey listener.
+  /// Only the router variant needs a `builder`; the loading + error
+  /// fallbacks render their `home` directly.
+  Widget _shellBuilder(BuildContext context, Widget? child) {
+    final brightness = Theme.of(context).brightness;
+    final overlayStyle = enjoySystemUiOverlayStyle(brightness);
+    final viewport = ConstrainedAppViewport(
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: overlayStyle,
+        child: child ?? const SizedBox.shrink(),
+      ),
+    );
+    final hosted = AuthDeepLinkListener(
+      child: UpdatePromptHost(child: viewport),
+    );
+    return isDesktop ? AppHotkeysKeyboardListener(child: hosted) : hosted;
+  }
+
+  Widget _loadingBranch(
+    ThemeData theme,
+    ThemeData darkTheme,
+    ThemeMode themeMode,
+  ) {
+    return _baseMaterialApp(
+      theme: theme,
+      darkTheme: darkTheme,
+      themeMode: themeMode,
+      home: const ConstrainedAppViewport(
+        child: Scaffold(body: Center(child: SkeletonAppBootstrap())),
+      ),
+    );
+  }
+
+  Widget _errorBranch(
+    ThemeData theme,
+    ThemeData darkTheme,
+    ThemeMode themeMode,
+    Object error,
+    StackTrace? stack,
+  ) {
+    final isDb = isUnrecoverableDatabaseError(error);
+    return _baseMaterialApp(
+      theme: theme,
+      darkTheme: darkTheme,
+      themeMode: themeMode,
+      home: isDb
+          ? RecoverySurface(
+              error: error,
+              stack: stack,
+              onReset: () {
+                ref.invalidate(recoveryResetResultProvider);
+                return ref.read(recoveryResetResultProvider.future);
+              },
+            )
+          : ConstrainedAppViewport(
+              child: Scaffold(
+                body: Center(
+                  child: Text(
+                    AppLocalizations.of(context)!.errorGenericLoadFailed,
+                  ),
+                ),
+              ),
+            ),
+    );
+  }
+
+  Widget _routerBranch({
+    required GoRouter router,
+    required ThemeData theme,
+    required ThemeData darkTheme,
+    required ThemeMode themeMode,
+    required AppPreferencesState prefs,
+  }) {
+    return _baseMaterialApp(
+      theme: theme,
+      darkTheme: darkTheme,
+      themeMode: themeMode,
+      home: const SizedBox.shrink(),
+      router: router,
+      prefs: prefs,
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(ref.read(analyticsInitProvider.future));
+    unawaited(ref.read(networkProxySettingsProvider.future));
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.detached) {
+      unawaited(
+        closeAndClearAllAppDatabases().catchError((
+          Object error,
+          StackTrace st,
+        ) {
+          _log.warning(
+            'shutdown: closeAndClearAllAppDatabases failed',
+            error,
+            st,
+          );
+        }),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.listen<AsyncValue<AppPreferencesState>>(appPreferencesCtrlProvider, (
+      prev,
+      next,
+    ) {
+      final nextPrefs = next.valueOrNull;
+      if (nextPrefs == null) return;
+      if (identical(nextPrefs, _lastResolvedPrefs)) return;
+      setState(() {
+        _lastResolvedPrefs = nextPrefs;
+      });
+    });
+
+    final router = ref.watch(appRouterProvider);
+    final prefsAsync = ref.watch(appPreferencesCtrlProvider);
+    final overrideTheme = widget.themeBuilder?.call();
+    final lightTheme = overrideTheme ?? buildAppTheme(Brightness.light);
+    final darkTheme = overrideTheme ?? buildAppTheme(Brightness.dark);
+
+    final live = prefsAsync.valueOrNull;
+    final effective = live ?? _lastResolvedPrefs;
+    final themeMode = effective?.themeMode ?? ThemeMode.system;
+
+    if (prefsAsync.hasError && effective == null) {
+      return _errorBranch(
+        lightTheme,
+        darkTheme,
+        themeMode,
+        prefsAsync.error!,
+        prefsAsync.stackTrace,
+      );
+    }
+
+    if (prefsAsync.isLoading && effective == null) {
+      return _loadingBranch(lightTheme, darkTheme, themeMode);
+    }
+
+    final authBootstrapping = ref.watch(
+      authCtrlProvider.select((auth) => auth.isLoading && !auth.hasValue),
+    );
+    if (authBootstrapping) {
+      return _loadingBranch(lightTheme, darkTheme, themeMode);
+    }
+
+    return _routerBranch(
+      router: router,
+      theme: lightTheme,
+      darkTheme: darkTheme,
+      themeMode: themeMode,
+      prefs: effective ?? AppPreferencesState.initial,
+    );
+  }
+}

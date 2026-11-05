@@ -1,0 +1,200 @@
+import 'package:enjoy_player/core/cache/lru_store.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  const ttl = Duration(seconds: 1);
+
+  group('L1Store', () {
+    test('peek returns cached value after put', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      store.put('a', 1);
+      expect(store.peek('a'), 1);
+      expect(store.size, 1);
+    });
+
+    test('peek returns null on miss', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      expect(store.peek('nope'), isNull);
+    });
+
+    test('lru evicts oldest on overflow', () {
+      final store = L1Store<String, int>(capacity: 3, ttl: ttl);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.put('c', 3);
+      store.put('d', 4);
+      expect(store.peek('a'), isNull);
+      expect(store.peek('b'), 2);
+      expect(store.peek('c'), 3);
+      expect(store.peek('d'), 4);
+      expect(store.size, 3);
+    });
+
+    test('peek updates lru position so a touched entry survives eviction', () {
+      final store = L1Store<String, int>(capacity: 3, ttl: ttl);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.put('c', 3);
+      expect(store.peek('a'), 1);
+      store.put('d', 4);
+      expect(store.peek('a'), 1);
+      expect(store.peek('b'), isNull);
+      expect(store.peek('c'), 3);
+      expect(store.peek('d'), 4);
+    });
+
+    test('peek returns null after ttl elapses and removes the entry', () {
+      final store = L1Store<String, int>(
+        capacity: 4,
+        ttl: const Duration(milliseconds: 10),
+      );
+      store.put('a', 1);
+      expect(store.peek('a'), 1);
+      return Future<void>.delayed(const Duration(milliseconds: 25)).then((_) {
+        expect(store.peek('a'), isNull);
+        expect(store.size, 0);
+      });
+    });
+
+    test('put overwrites existing key and resets position', () {
+      final store = L1Store<String, int>(capacity: 3, ttl: ttl);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.put('c', 3);
+      store.put('a', 99);
+      store.put('d', 4);
+      expect(store.peek('a'), 99);
+      expect(store.peek('b'), isNull);
+      expect(store.peek('c'), 3);
+      expect(store.peek('d'), 4);
+    });
+
+    test('clear drops every entry', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.clear();
+      expect(store.size, 0);
+      expect(store.peek('a'), isNull);
+      expect(store.peek('b'), isNull);
+    });
+
+    test('invalidate removes a single entry', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.invalidate('a');
+      expect(store.peek('a'), isNull);
+      expect(store.peek('b'), 2);
+      expect(store.size, 1);
+    });
+
+    test('invalidate is a no-op for absent key', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      store.invalidate('nope');
+      expect(store.size, 0);
+    });
+
+    test('size returns current entry count', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      expect(store.size, 0);
+      store.put('a', 1);
+      expect(store.size, 1);
+      store.put('b', 2);
+      expect(store.size, 2);
+      store.invalidate('a');
+      expect(store.size, 1);
+    });
+
+    test('asserts on non-positive capacity', () {
+      expect(
+        () => L1Store<String, int>(capacity: 0, ttl: ttl),
+        throwsA(isA<AssertionError>()),
+      );
+    });
+
+    test('asserts on negative ttl', () {
+      expect(
+        () =>
+            L1Store<String, int>(capacity: 4, ttl: const Duration(seconds: -1)),
+        throwsA(isA<AssertionError>()),
+      );
+    });
+
+    test('zero ttl expires on any subsequent read', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: Duration.zero);
+      store.put('a', 1);
+      expect(store.peek('a'), isNull);
+    });
+  });
+
+  group('L1Store without ttl', () {
+    test('peek does not age-expire entries', () {
+      final store = L1Store<String, int>(capacity: 4);
+      store.put('a', 1);
+      return Future<void>.delayed(const Duration(milliseconds: 25)).then((_) {
+        expect(store.peek('a'), 1);
+        expect(store.size, 1);
+      });
+    });
+
+    test('still evicts the lru tail on overflow', () {
+      final store = L1Store<String, int>(capacity: 2);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.put('c', 3);
+      expect(store.peek('a'), isNull);
+      expect(store.peek('b'), 2);
+      expect(store.peek('c'), 3);
+      expect(store.size, 2);
+    });
+
+    test('accepts an explicit null ttl', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: null);
+      store.put('a', 1);
+      expect(store.peek('a'), 1);
+    });
+  });
+
+  group('L1Store.peekNoTouch', () {
+    test('returns the value without changing lru order', () {
+      final store = L1Store<String, int>(capacity: 3, ttl: ttl);
+      store.put('a', 1);
+      store.put('b', 2);
+      store.put('c', 3);
+      expect(store.peekNoTouch('a'), 1);
+      store.put('d', 4);
+      expect(store.peekNoTouch('a'), isNull);
+      expect(store.peekNoTouch('b'), 2);
+      expect(store.peekNoTouch('c'), 3);
+      expect(store.peekNoTouch('d'), 4);
+    });
+
+    test('returns null on miss', () {
+      final store = L1Store<String, int>(capacity: 4, ttl: ttl);
+      expect(store.peekNoTouch('nope'), isNull);
+    });
+
+    test('treats an expired entry as a miss but leaves it in place', () {
+      final store = L1Store<String, int>(
+        capacity: 4,
+        ttl: const Duration(milliseconds: 10),
+      );
+      store.put('a', 1);
+      return Future<void>.delayed(const Duration(milliseconds: 25)).then((_) {
+        expect(store.peekNoTouch('a'), isNull);
+        expect(store.size, 1);
+        expect(store.peek('a'), isNull);
+        expect(store.size, 0);
+      });
+    });
+
+    test('does not age-expire on a no-ttl store', () {
+      final store = L1Store<String, int>(capacity: 4);
+      store.put('a', 1);
+      return Future<void>.delayed(const Duration(milliseconds: 25)).then((_) {
+        expect(store.peekNoTouch('a'), 1);
+      });
+    });
+  });
+}

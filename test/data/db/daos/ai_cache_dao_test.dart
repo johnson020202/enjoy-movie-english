@@ -1,0 +1,196 @@
+import 'package:drift/native.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  late AppDatabase db;
+
+  setUp(() {
+    db = AppDatabase(executor: NativeDatabase.memory());
+  });
+
+  tearDown(() async {
+    await db.close();
+  });
+
+  group('AiCacheDao', () {
+    test('read returns null for missing kind/key', () async {
+      expect(await db.aiCacheDao.read('dictionary', 'missing'), isNull);
+    });
+
+    test('upsert + read round-trip', () async {
+      await db.aiCacheDao.upsert(
+        'dictionary',
+        'hello',
+        '{"translation":"hola"}',
+        DateTime.utc(2026, 1, 1),
+      );
+      final row = await db.aiCacheDao.read('dictionary', 'hello');
+      expect(row, isNotNull);
+      expect(row!.payloadJson, '{"translation":"hola"}');
+      expect(row.updatedAt, DateTime.utc(2026, 1, 1).millisecondsSinceEpoch);
+    });
+
+    test('upsert replaces existing payload', () async {
+      await db.aiCacheDao.upsert(
+        'dictionary',
+        'hello',
+        'v1',
+        DateTime.utc(2026, 1, 1),
+      );
+      await db.aiCacheDao.upsert(
+        'dictionary',
+        'hello',
+        'v2',
+        DateTime.utc(2026, 6, 1),
+      );
+      final row = await db.aiCacheDao.read('dictionary', 'hello');
+      expect(row!.payloadJson, 'v2');
+      expect(row.updatedAt, DateTime.utc(2026, 6, 1).millisecondsSinceEpoch);
+    });
+
+    test('deleteRow removes a single kind/key', () async {
+      await db.aiCacheDao.upsert('dictionary', 'a', 'A', DateTime.utc(2026));
+      await db.aiCacheDao.upsert('dictionary', 'b', 'B', DateTime.utc(2026));
+      await db.aiCacheDao.deleteRow('dictionary', 'a');
+      expect(await db.aiCacheDao.read('dictionary', 'a'), isNull);
+      expect(await db.aiCacheDao.read('dictionary', 'b'), isNotNull);
+    });
+
+    test('deleteRow on missing row is a no-op', () async {
+      await db.aiCacheDao.deleteRow('dictionary', 'missing');
+    });
+
+    test('deleteForKind removes all rows for a kind', () async {
+      await db.aiCacheDao.upsert('dictionary', 'a', 'A', DateTime.utc(2026));
+      await db.aiCacheDao.upsert('dictionary', 'b', 'B', DateTime.utc(2026));
+      await db.aiCacheDao.upsert('translation', 'c', 'C', DateTime.utc(2026));
+
+      await db.aiCacheDao.deleteForKind('dictionary');
+      expect(await db.aiCacheDao.countForKind('dictionary'), 0);
+      expect(await db.aiCacheDao.countForKind('translation'), 1);
+    });
+
+    test('countForKind counts all rows for that kind', () async {
+      await db.aiCacheDao.upsert('dictionary', 'a', 'A', DateTime.utc(2026));
+      await db.aiCacheDao.upsert('dictionary', 'b', 'B', DateTime.utc(2026));
+      await db.aiCacheDao.upsert('translation', 'c', 'C', DateTime.utc(2026));
+      expect(await db.aiCacheDao.countForKind('dictionary'), 2);
+      expect(await db.aiCacheDao.countForKind('translation'), 1);
+      expect(await db.aiCacheDao.countForKind('missing'), 0);
+    });
+
+    test('evictOldestExcept keeps the N most recent entries', () async {
+      for (var i = 0; i < 4; i++) {
+        await db.aiCacheDao.upsert(
+          'dictionary',
+          'k$i',
+          '{"i":$i}',
+          DateTime.utc(2026, 1, 1).add(Duration(minutes: i)),
+        );
+      }
+      final removed = await db.aiCacheDao.evictOldestExcept('dictionary', 2);
+      expect(removed, 2);
+      expect(await db.aiCacheDao.countForKind('dictionary'), 2);
+      expect(await db.aiCacheDao.read('dictionary', 'k0'), isNull);
+      expect(await db.aiCacheDao.read('dictionary', 'k1'), isNull);
+      expect(await db.aiCacheDao.read('dictionary', 'k2'), isNotNull);
+      expect(await db.aiCacheDao.read('dictionary', 'k3'), isNotNull);
+    });
+
+    test('evictOldestExcept is a no-op when total <= keep', () async {
+      await db.aiCacheDao.upsert('dictionary', 'a', 'A', DateTime.utc(2026));
+      await db.aiCacheDao.upsert('dictionary', 'b', 'B', DateTime.utc(2026));
+      expect(await db.aiCacheDao.evictOldestExcept('dictionary', 5), 0);
+      expect(await db.aiCacheDao.countForKind('dictionary'), 2);
+    });
+
+    test('pruneOlderThan removes only older entries', () async {
+      final cutoff = DateTime.utc(2026, 6, 1);
+      await db.aiCacheDao.upsert(
+        'dictionary',
+        'old',
+        'O',
+        DateTime.utc(2026, 1, 1),
+      );
+      await db.aiCacheDao.upsert(
+        'dictionary',
+        'recent',
+        'R',
+        DateTime.utc(2026, 12, 1),
+      );
+      final removed = await db.aiCacheDao.pruneOlderThan('dictionary', cutoff);
+      expect(removed, 1);
+      expect(await db.aiCacheDao.read('dictionary', 'old'), isNull);
+      expect(await db.aiCacheDao.read('dictionary', 'recent'), isNotNull);
+    });
+
+    test(
+      'deleteForPair bulk-deletes matching rows across kinds (issue #827 C4)',
+      () async {
+        await db.aiCacheDao.upsert(
+          'translation',
+          'k1',
+          '{"sourceLanguage":"en","targetLanguage":"es"}',
+          DateTime.utc(2026),
+          sourceLanguage: 'en',
+          targetLanguage: 'es',
+        );
+        await db.aiCacheDao.upsert(
+          'dictionary',
+          'k2',
+          '{"sourceLanguage":"en","targetLanguage":"es"}',
+          DateTime.utc(2026),
+          sourceLanguage: 'en',
+          targetLanguage: 'es',
+        );
+        await db.aiCacheDao.upsert(
+          'translation',
+          'k3',
+          '{"sourceLanguage":"en","targetLanguage":"ja"}',
+          DateTime.utc(2026),
+          sourceLanguage: 'en',
+          targetLanguage: 'ja',
+        );
+        await db.aiCacheDao.upsert(
+          'translation',
+          'k4',
+          '{"sourceLanguage":"fr","targetLanguage":"de"}',
+          DateTime.utc(2026),
+          sourceLanguage: 'fr',
+          targetLanguage: 'de',
+        );
+
+        final deleted = await db.aiCacheDao.deleteForPair('en', 'es');
+        expect(deleted, 2);
+        expect(await db.aiCacheDao.read('translation', 'k1'), isNull);
+        expect(await db.aiCacheDao.read('dictionary', 'k2'), isNull);
+        expect(await db.aiCacheDao.read('translation', 'k3'), isNotNull);
+        expect(await db.aiCacheDao.read('translation', 'k4'), isNotNull);
+      },
+    );
+
+    test('deleteForPair returns 0 when no rows match', () async {
+      await db.aiCacheDao.upsert(
+        'translation',
+        'k1',
+        '{"sourceLanguage":"en"}',
+        DateTime.utc(2026),
+      );
+      final deleted = await db.aiCacheDao.deleteForPair('xx', 'yy');
+      expect(deleted, 0);
+    });
+
+    test('deleteForPair never matches rows stored without a pair', () async {
+      await db.aiCacheDao.upsert(
+        'translation',
+        'k1',
+        '{"sourceLanguage":"en","targetLanguage":"es"}',
+        DateTime.utc(2026),
+      );
+      final deleted = await db.aiCacheDao.deleteForPair('en', 'es');
+      expect(deleted, 0);
+      expect(await db.aiCacheDao.read('translation', 'k1'), isNotNull);
+    });
+  });
+}

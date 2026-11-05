@@ -1,0 +1,99 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Flutter golden comparator dumps (`matchesGoldenFile` writes these next to
+# the test when a snapshot mismatches). Keep goldens/; do not commit failures/.
+**/failures/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Optional Windows FFmpeg binary (see windows/ffmpeg/README.md)
+/windows/ffmpeg/ffmpeg.exe
+
+# ffmpeg_kit_flutter_new vendored frameworks (see packages/ffmpeg_kit_flutter_new/scripts/setup_*.sh)
+/packages/ffmpeg_kit_flutter_new/macos/Frameworks/
+/packages/ffmpeg_kit_flutter_new/ios/Frameworks/
+# Generated xcframeworks (built on demand by packages/ffmpeg_kit_flutter_new/scripts/build_ios_xcframeworks.sh)
+/packages/ffmpeg_kit_flutter_new/ios/FrameworksXc/
+
+# Tooling (SVG→PNG helper)
+/tool/node_modules/
+.venv-svg/
+
+# mise local overrides (machine-specific mirrors/proxies; mise reads it automatically)
+mise.local.toml
+
+# Local agentic planning scratch (Claude/Cursor/opencode session notes)
+/.zcode/
+
+# Apple signing
+.apple/
+*.p8
+
+# Local publish credentials (copy from .github/scripts/publish_env.example.ps1)
+.github/scripts/publish_env.local.ps1
+.github/scripts/publish_env.local.sh
+
+# fastlane (repo-local bundler install + lane run reports)
+.github/scripts/.fastlane-bundle/
+.bundle/
+fastlane/report.xml
+# Local Play service-account JSON (never commit)
+.github/scripts/play-service-account.json
+
+# Google keys
+.google/
+
+# WinSparkle update signing (generate with `dart run auto_updater:generate_keys`)
+dsa_priv.pem
+
+*.zip
+Enjoy Player*.app
+.superpowers
+
+# Temporary files
+tmp/*
+
+worktrees/
+.mimosa

@@ -1,0 +1,22 @@
+#
+# To learn more about a Podspec see http://guides.cocoapods.org/syntax/podspec.html.
+#
+Pod::Spec.new do |s|
+  s.name             = 'azure_speech'
+  s.version          = '0.1.0'
+  s.summary          = 'Azure Cognitive Services Speech SDK for Flutter'
+  s.description      = <<-DESC
+Wraps the Microsoft Cognitive Services Speech SDK on iOS. Pronunciation
+assessment is implemented first; additional APIs may follow.
+                       DESC
+  s.homepage         = 'https://github.com/enjoy'
+  s.license          = { :type => 'MIT', :file => '../LICENSE' }
+  s.author           = { 'Enjoy Player' => 'https://github.com' }
+  s.source           = { :path => '.' }
+  s.source_files = 'Classes/**/*'
+  s.dependency 'Flutter'
+  s.dependency 'MicrosoftCognitiveServicesSpeech-iOS', '~> 1.49.0'
+  s.platform = :ios, '14.0'
+  s.swift_version = '5.0'
+  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
+end

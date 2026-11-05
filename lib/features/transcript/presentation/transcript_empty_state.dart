@@ -1,0 +1,204 @@
+/// Placeholder when a medium has no transcript cues yet.
+library;
+
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/typography.dart';
+import 'package:enjoy_player/core/theme/widgets/editorial_header.dart';
+import 'package:enjoy_player/features/onboarding/domain/onboarding_tip_id.dart';
+import 'package:enjoy_player/features/onboarding/presentation/onboarding_target.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+import 'transcript_busy_action.dart';
+
+class TranscriptEmptyState extends StatelessWidget {
+  const TranscriptEmptyState({
+    required this.onImport,
+    this.onExtract,
+    this.onGenerate,
+    this.onFetchYoutube,
+    this.showImportButton = true,
+    this.showExtractButton = false,
+    this.showGenerateButton = false,
+    this.showFetchYoutubeButton = false,
+    super.key,
+  });
+
+  final Future<void> Function() onImport;
+
+  /// Embedded subtitle extract (local video only).
+  final Future<void> Function()? onExtract;
+
+  /// ASR transcript generation (local audio/video only).
+  final Future<void> Function()? onGenerate;
+
+  /// YouTube cloud transcript fetch.
+  final Future<void> Function()? onFetchYoutube;
+
+  /// When false, only remote/cloud hint copy (e.g. YouTube — no local file).
+  final bool showImportButton;
+
+  /// When true with [onExtract], shows an Extract control.
+  final bool showExtractButton;
+
+  /// When true with [onGenerate], shows an AI transcript control.
+  final bool showGenerateButton;
+
+  /// When true with [onFetchYoutube], shows Fetch transcript for YouTube.
+  final bool showFetchYoutubeButton;
+
+  bool get _hasActions =>
+      showImportButton ||
+      showExtractButton ||
+      showGenerateButton ||
+      showFetchYoutubeButton;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    final hint = showFetchYoutubeButton && !showImportButton
+        ? l10n.noTranscriptHintRemote
+        : (_hasActions ? l10n.noTranscriptHint : l10n.noTranscriptHintRemote);
+
+    final wrapExtract = showExtractButton && onExtract != null;
+    final wrapImport = showImportButton && !wrapExtract;
+
+    return LayoutBuilder(
+      builder: (context, viewport) {
+        return SingleChildScrollView(
+          padding: EdgeInsets.symmetric(
+            horizontal: t.space16,
+            vertical: t.space24,
+          ),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: viewport.maxHeight),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  EnjoyOverline(l10n.transcriptEmptyOverline),
+                  SizedBox(height: t.space12),
+                  Text(
+                    l10n.noTranscript,
+                    style: enjoyDisplayStyle(
+                      context,
+                      size: 38,
+                      height: 1.12,
+                      letterSpacing: -0.76,
+                      color: scheme.onSurface,
+                    ),
+                  ),
+                  SizedBox(height: t.space12),
+                  Text(
+                    hint,
+                    style: textTheme.bodyMedium?.copyWith(
+                      fontSize: 15,
+                      height: 1.6,
+                      color: t.ink2,
+                    ),
+                  ),
+                  if (_hasActions) ...[
+                    SizedBox(height: t.space24 + 4),
+                    _EmptyActionColumn(
+                      children: [
+                        if (showFetchYoutubeButton && onFetchYoutube != null)
+                          OnboardingTarget(
+                            tipId: OnboardingTipId.playerEmptyTranscriptYoutube,
+                            onTargetAction: () {
+                              unawaited(onFetchYoutube!());
+                            },
+                            child: TranscriptBusyButton(
+                              icon: EnjoyIcons.cloudDownload,
+                              label: l10n.transcriptEmptyFetchYoutube,
+                              onPressed: onFetchYoutube!,
+                              filled: true,
+                            ),
+                          ),
+                        if (showGenerateButton && onGenerate != null)
+                          TranscriptBusyButton(
+                            icon: EnjoyIcons.sparkleFill,
+                            label: l10n.transcriptEmptyGenerate,
+                            onPressed: onGenerate!,
+                            filled: !showFetchYoutubeButton,
+                          ),
+                        if (showImportButton)
+                          _maybeWrapLocal(
+                            wrap: wrapImport,
+                            child: TranscriptBusyButton(
+                              icon: EnjoyIcons.fileUpload,
+                              label: l10n.transcriptEmptyAddSubtitle,
+                              onPressed: onImport,
+                              filled:
+                                  !showGenerateButton &&
+                                  !showFetchYoutubeButton,
+                            ),
+                            onAction: () {
+                              unawaited(onImport());
+                            },
+                          ),
+                        if (showExtractButton && onExtract != null)
+                          _maybeWrapLocal(
+                            wrap: wrapExtract,
+                            child: TranscriptBusyButton(
+                              icon: EnjoyIcons.subtitles,
+                              label: l10n.transcriptEmptyExtract,
+                              onPressed: onExtract!,
+                            ),
+                            onAction: () {
+                              unawaited(onExtract!());
+                            },
+                          ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _maybeWrapLocal({
+    required bool wrap,
+    required Widget child,
+    required VoidCallback onAction,
+  }) {
+    if (!wrap) return child;
+    return OnboardingTarget(
+      tipId: OnboardingTipId.playerEmptyTranscriptLocal,
+      onTargetAction: onAction,
+      child: child,
+    );
+  }
+}
+
+class _EmptyActionColumn extends StatelessWidget {
+  const _EmptyActionColumn({required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = EnjoyThemeTokens.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (var i = 0; i < children.length; i++) ...[
+          if (i > 0) SizedBox(height: t.space8),
+          children[i],
+        ],
+      ],
+    );
+  }
+}

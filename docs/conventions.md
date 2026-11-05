@@ -1,0 +1,208 @@
+# Conventions
+
+## Layout
+
+- `lib/features/<feature>/{application,data,domain,presentation}/`
+- Shared code: `lib/core`, `lib/data`
+- Generated files: `*.g.dart` / `*.freezed.dart` (never hand-edit; regenerate with `build_runner` and commit)
+
+## Format and codegen (CI)
+
+CI fails on unformatted Dart and on stale generated files. Before push:
+
+```bash
+bash .github/scripts/validate_ci_gates.sh
+```
+
+`dart format` covers `lib`, `test`, and `packages/*/lib` + `packages/*/test`. After Drift / Riverpod / Freezed annotation edits, regenerate and commit — see [AGENTS.md](../AGENTS.md#codegen).
+
+## Naming
+
+- Files: `snake_case.dart`
+- Widgets / classes: `UpperCamelCase`
+- Providers: generated `*Provider` from `@Riverpod` names
+
+## Imports
+
+Prefer `package:enjoy_player/...` for cross-layer imports in presentation code to avoid fragile relative paths.
+
+## Code quality
+
+- Keep production code in `lib/features/<feature>/{application,data,domain,presentation}/`, `lib/core`, or `lib/data`.
+- Domain models stay UI-free. Presentation widgets delegate state orchestration to Riverpod providers/notifiers.
+- SQLite access goes through Drift DAOs backed by `AppDatabase`; do not add raw SQL in UI or feature widgets.
+- Use `package:logging` through project logging helpers; do not call `print()`.
+- Do not construct `media_kit` `Player()` outside `MediaKitPlayerEngine` / `PlayerController`.
+
+## Comments (zero-comment policy)
+
+The codebase carries **no explanatory `//` comments** — narration ("// 2. Recognize"), section banners ("// ── Motion ──"), TODOs, review breadcrumbs ("// review on #798"), and why-essays are all banned in `lib/`, `test/`, and authored `packages/` code. The only permitted `//` comments are analyzer directives (`// ignore:`, `// ignore_for_file:`, `// coverage:ignore`).
+
+- **Code explains itself.** If a line needs a what-comment, rename it (`errSecDuplicateItem` over `duplicateItemStatus = -25299`), extract it into a named constant/method, or tighten its types until it doesn't. Magic values get named constants, not trailing glosses.
+- **Why-knowledge lives in docs, not beside the code.** Platform quirks, concurrency invariants, and design rationale go in `docs/features/<feature>.md` or an ADR, where they are reviewed and linked; a comment anchored to one call-site rots the moment its neighbor changes. If the constraint is local and mechanical, encode it as an assertion, a named guard, or a test instead.
+- **`///` dartdoc is API documentation, not explanation.** A doc comment is acceptable only when it states a contract the declaration cannot — parameter/return behavior, value ranges, cross-references. Never restate the declaration name ("/// The media id."), and never narrate process or history.
+- **Never leave commented-out code** — delete it; git remembers.
+- Generated files (`lib/l10n/`, `*.g.dart`, `*.freezed.dart`) and vendored upstream forks (`packages/ffmpeg_kit_flutter_new`, `packages/flutter_secure_storage_linux`) keep their own commenting style and are exempt.
+
+## Page layout
+
+- Every new shell / push screen picks an **`EnjoyPageKind`** (`browse` | `hub` | `form` | `auth` | `playerChrome`) and builds through **`EnjoyPage`** (or applies `EnjoyPageMetrics` / `pageGutterOf` consistently).
+- Widths come from tokens only: browse = full pane + `pageGutter`; hub = `hubMaxWidth` (840); form = `formMaxWidth` (680); auth = `modalMaxWidth` (400). Do **not** use informal `contentMaxWidth + 96` or unconstrained desktop forms.
+- Push routes use **`EnjoySubpageAppBar`** (via `EnjoyPage(showBack: true)`), not one-off `AppBar` / custom back rows. Primary tabs use **`EditorialHeader`** with gutter-aligned width so titles match browse bodies.
+- See [ADR-0055](decisions/0055-adaptive-page-layout-system.md) and [app-ui.md § Page layout](features/app-ui.md#page-layout).
+
+## UI interaction
+
+- Prefer **`EnjoyTappableSurface` / `EnjoyTappableIcon`** (or **`EnjoyButton`**) for new tappable UI instead of ad-hoc `InkWell` + `GestureDetector` combinations — see [ADR-0018](decisions/0018-shared-interactive-primitives.md).
+- For **rail-style navigation surfaces** (sidebar nav rows, settings two-pane rail), prefer **`NavItemPill`** ([`core/theme/widgets/nav_item_pill.dart`](../lib/core/theme/widgets/nav_item_pill.dart)) — it consolidates the `Material` + `InkWell` + `AnimatedContainer` stack with consistent focus ring, hover/splash colors, and selected-tinted background. Supports configurable `iconSize`, `selectedIcon` fallback, and `maxLines`/`overflow` for label ellipsis.
+- Route light user feedback through **`Haptics`** (`selection`, `impactMedium`, `success`, `warning`) rather than calling `HapticFeedback` directly; it honors reduced motion / platform.
+- Icon-only controls should still expose **`Tooltip`** (and keyboard hints via `kbd_chip` / hotkey helpers where applicable).
+- Use **`LoadingIcon`** ([`core/presentation/loading_icon.dart`](../lib/core/presentation/loading_icon.dart)) for inline busy affordances (button labels, list rows, chips) instead of hand-rolling a `SizedBox` + `CircularProgressIndicator` pair — defaults to a compact 18×18 spinner, configurable via `size` / `strokeWidth` / `color`. See [app-ui.md § Widgets reference](features/app-ui.md#widgets-reference).
+- Use **`SectionLabel`** ([`core/presentation/section_label.dart`](../lib/core/presentation/section_label.dart)) for in-card section headers (icon + bold `labelLarge` text) so BYOK and other settings surfaces share the same heading rhythm. See [app-ui.md § Widgets reference](features/app-ui.md#widgets-reference).
+- User-visible strings live in ARB localization files under `lib/l10n/`. Every ARB key must be filled for all shipped locales (validated by `flutter gen-l10n`). No non-localized English (or other source-language) fallbacks, no `Text('$error')` exception dumps, no hardcoded accessibility labels.
+
+## Logging
+
+```dart
+import 'package:enjoy_player/core/logging/log.dart';
+
+final log = logNamed('MyFeature');
+log.info('hello');
+```
+
+## Riverpod
+
+- Long-lived globals: `@Riverpod(keepAlive: true)`
+- Prefer `Notifier` / generated providers over mutable singletons.
+- Avoid circular dependencies: UI sync widgets listen to `Player` streams instead of `PlayerController` calling `PlayerUi` directly.
+- **No build-time side effects**: don't read a provider's value and assign it to a `State` field directly inside `build()` — that mutates state as a side effect of building, which Flutter disallows triggering a rebuild from. Instead use `ref.listen` at the top of `build()` and call `setState` from the listener callback. Example (`_EnjoyAppState.build` in [`app.dart`](../lib/app.dart) mirrors `appPreferencesCtrlProvider` into `_lastResolvedPrefs` so the last-known preferences stay visible during an auth-scoped DB switch reload):
+
+```dart
+@override
+Widget build(BuildContext context) {
+  ref.listen<AsyncValue<AppPreferencesState>>(appPreferencesCtrlProvider, (
+    prev,
+    next,
+  ) {
+    final nextPrefs = next.valueOrNull;
+    if (nextPrefs == null) return;
+    if (identical(nextPrefs, _lastResolvedPrefs)) return;
+    setState(() => _lastResolvedPrefs = nextPrefs);
+  });
+  // ...
+}
+```
+
+## Database
+
+- No SQL strings outside Drift-generated / DAO code.
+- Use `NativeDatabase.memory()` in tests (see `test/data/db/app_database_test.dart`).
+
+## REST services
+
+Every `*Api` class under `lib/data/api/services/` follows the same shape — see [api/rest-services.md](api/rest-services.md) for the full reference. Short version:
+
+- Extend [`RestApi`](../lib/data/api/rest_api.dart); forward the client with `super(client)`.
+- Do **not** declare your own `typedef JsonMap` — import it from [`api_client.dart`](../lib/data/api/api_client.dart) and use it for both request bodies and response shapes.
+- Pick the right `*ApiClient` provider (`authApiClient` / `apiClient` / `aiApiClient`) for the endpoint's base URL and auth posture; do not instantiate `ApiClient` directly.
+- Expose services through a `keepAlive` Riverpod provider in `services/<area>/`, never construct them in widgets.
+
+## Testing
+
+- Unit tests for pure logic (`echo_window`, subtitle parsers, repositories), DAOs, and Riverpod notifiers.
+- Widget or integration tests for changed navigation, input, localization, platform chrome, and shared UI behavior.
+- Every behavior change needs automated coverage or a documented manual verification reason (see [testing.md](testing.md)).
+
+## Performance
+
+- Keep expensive file, image, transcript, database, and audio work out of `build` methods and list/grid item builders.
+- Cache, stream, page, debounce, or move heavy work off the main isolate when it can block frames.
+- Include a performance goal or verification note for playback, startup, scrolling, transcript rendering, sync, and media import changes.
+
+## Sliver performance (long live lists)
+
+Grids/lists backed by a Drift stream or an RSS refresh re-emit their full item list on every change, even when only one row changed. Without a stable key + lookup, `SliverChildBuilderDelegate` falls back to rebuilding **every visible child** on each emission.
+
+Use a stable `ValueKey<String>` per row plus `findChildIndexCallback` so Flutter can re-use existing `Element`s instead of tearing them down:
+
+```dart
+SliverChildBuilderDelegate(
+  (context, index) => Tile(key: ValueKey<String>('$kPrefix${items[index].id}'), ...),
+  childCount: items.length,
+  findChildIndexCallback: (key) => findSliverIndexByPrefixedId(
+    items: items,
+    key: key,
+    prefix: kPrefix,
+    idOf: (item) => item.id,
+  ),
+)
+```
+
+[`findSliverIndexByPrefixedId<T>`](../lib/core/utils/sliver_key_index.dart) centralizes the key-shape lookup so the prefix used when constructing the `ValueKey` cannot drift from the prefix used in `findChildIndexCallback`. It returns `null` for any key that doesn't match (wrong type, wrong prefix, or no matching id), which tells the sliver framework to fall back to its default scan for that child.
+
+Applied to the home recents grid (`home-media-` prefix), the discover merged feed grid (`discover-feed-` prefix), and the channel feed grid (`channel-feed-` prefix) — see [features/library.md](features/library.md) and [features/discover.md](features/discover.md). Covered by `test/core/utils/sliver_key_index_test.dart`.
+
+## Stream dedupe (long live streams)
+
+Drift `watchX` queries emit a fresh list on **every** write that touches the underlying tables (or any table in the same query graph), even when the post-mapping value is identical to the previous one. A `StreamProvider` wrapping such a stream re-emits the new list to every listener, and Riverpod rebuilds the dependents — visible as redundant rebuilds for always-mounted UI (transport bar, app shell badges).
+
+The shared [`StreamDistinctExt.distinctBy<T>`](../lib/core/utils/stream_distinct.dart) extension collapses those no-op emissions before they reach listeners. Pair it with the element-wise [`listEquals`](https://api.flutter.dev/flutter/foundation/listEquals.html) from `package:flutter/foundation.dart`:
+
+```dart
+import 'package:flutter/foundation.dart';
+
+_db.transcriptDao.watchSummariesForTarget(tt, mediaId)
+    .map((rows) => rows.map(_trackFromSummary).toList())
+    .distinctBy(listEquals);
+```
+
+Three rules keep the pattern cheap and correct:
+
+1. **Define value equality on the element type.** `List` defaults to identity, so a list comparator must compare elements via their own `==` / `hashCode`. Use Flutter's `listEquals` (`package:flutter/foundation.dart`) rather than writing a private `_listEquals*` helper per feature. Drift rows (`TranscriptRow`, `RecordingRow`, …) get `==`/`hashCode` from generated code; hand-written domain models used by dedupe (e.g. `TranscriptTrack`, `Media`, `DiscoverChannel`, `FeedEntry`, `TranscriptLine`, `ArtworkPalette`) must override both.
+2. **Keep dedupe state per subscriber.** `StreamDistinctExt` stores the "last seen" reference in the per-subscription controller so two subscribers on the same source stream each see every emission — matches Drift's per-subscriber semantics and avoids cross-talk between consumers.
+3. **Forward errors and stay open.** The extension propagates upstream errors and only closes when the upstream completes, so a transient Drift error does not poison the rest of the pipeline.
+
+Applied to (all dedupe via `distinctBy(listEquals)`):
+
+- [`TranscriptRepository.watchTracks`](../lib/features/transcript/data/transcript_repository.dart) — drives `allTranscriptsForMediaProvider`, consumed by `TransportCcButton` (always mounted in the transport bar) and the subtitle track picker.
+- [`transcriptLinesProvider`](../lib/features/transcript/application/transcript_lines_provider.dart) — keeps the transcript panel from rebuilding on each session bump.
+- [`libraryMediaProvider`](../lib/features/library/application/library_media_provider.dart) — `List<Media>` for the home recents grid.
+- [`libraryFilteredListsProvider`](../lib/features/library/application/library_media_provider.dart) — `(List<Media>, List<Media>)` for the Library screen's video/audio tabs.
+- [`libraryRepository`](../lib/features/library/data/library_repository.dart) — merged tab-flattened `List<Media>` for `libraryMediaProvider`.
+- [`DiscoverRepository`](../lib/features/discover/data/discover_repository.dart) — `List<DiscoverChannel>` (subscriptions) and `List<FeedEntry>` (merged feed + channel feed).
+- [`RecordingDao`](../lib/data/db/daos/recording_dao.dart) — `List<RecordingRow>` for shadow-reading playback state.
+
+Covered by `test/core/utils/stream_distinct_test.dart` (first-value forward, drop-on-equal, structural equality, per-subscriber isolation, error propagation) plus per-feature `*_dedupe_test.dart` suites (transcript tracks / lines, recordings, discover).
+
+## Caching
+
+For new in-memory caches, prefer the shared
+[`L1Store<K, V>`](../lib/core/cache/lru_store.dart) primitive in
+`lib/core/cache/` over a hand-rolled `LinkedHashMap` LRU. It
+encapsulates the boring bookkeeping (move-to-end on hit, evict the
+tail on overflow) and adds an **optional TTL** — omit `ttl` (or pass
+`null`) and entries never age-expire, leaving only LRU overflow and
+explicit removal; a no-TTL store never consults the clock on reads.
+The primitive is intentionally generic and lives under `lib/core/` because
+several features need the same shape — do not re-implement it
+feature-local.
+
+Current call sites:
+
+- [`AiResultCache` L1 tier](../lib/features/ai/application/ai_result_cache.dart) — 256 entries / 30 min TTL per AI modality, see [ADR-0045](decisions/0045-ai-result-cache-hierarchy.md).
+- `LookupSheetResultCache` — same primitive after ADR-0045 slimmed down its internal maps.
+- [`DiscoverRepository`](../lib/features/discover/data/discover_repository.dart) — channel-avatar URL cache, 256 entries / 6 h TTL, see [features/discover.md § Channel avatar cache](features/discover.md#channel-avatar-cache).
+- [`youtubeProfiles`](../lib/features/transcript/data/youtube_profiles_provider.dart) — worker client-profile list, 1 entry / 24 h TTL.
+- [`TranscriptTimelineCache`](../lib/features/transcript/data/transcript_timeline_codec.dart) — decoded `timelineJson` memo, 8 rows / no TTL (invalidation is revision based: `(updatedAt, jsonLength)` guarded by the DAO's same-second upsert nudge), see [features/transcript.md](features/transcript.md).
+
+Behavior contract:
+
+- `peek(key)` returns the value and bumps the entry to MRU; on TTL expiry it removes the entry and returns `null`.
+- `peekNoTouch(key)` is the read-only probe: it returns the value without reordering LRU, so "do I have this?" checks cannot keep entries alive. Expired entries read as misses but are left in place.
+- `put(key, value)` overwrites existing entries and evicts the LRU tail when at capacity.
+- `invalidate(key)` and `clear()` are the only escape hatches — call them on explicit cache busts (`forceRefresh`, sign-out, schema migration).
+
+When a feature also needs persistent caching across restarts, pair
+`L1Store` with a Drift-backed L2 (see `AiResultCache` for the canonical
+two-tier shape). For per-DB scoped caches the L2 table lives in
+`app_database.dart` so its lifetime matches the user-database file.

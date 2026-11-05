@@ -1,0 +1,284 @@
+/// Riverpod providers for Discover feeds.
+library;
+
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/widgets.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+
+import 'package:enjoy_player/core/application/app_language_catalog.dart';
+import 'package:enjoy_player/core/application/app_preferences_provider.dart';
+import 'package:enjoy_player/core/logging/log.dart';
+import 'package:enjoy_player/core/riverpod/async_value_x.dart';
+import 'package:enjoy_player/core/utils/stream_distinct.dart';
+import 'package:enjoy_player/core/utils/remote_thumbnail_url.dart';
+import 'package:enjoy_player/data/api/services/ai/ai_api_providers.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/data/db/media_registry_provider.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/domain/auth_state.dart';
+import 'package:enjoy_player/features/discover/data/discover_repository.dart';
+import 'package:enjoy_player/features/discover/application/discover_feed_join.dart';
+import 'package:enjoy_player/features/discover/domain/discover_channel.dart';
+import 'package:enjoy_player/features/discover/domain/feed_entry.dart';
+import 'package:enjoy_player/features/discover/domain/recommended_channel.dart';
+import 'package:enjoy_player/features/library/application/library_repository_provider.dart';
+
+part 'discover_providers.g.dart';
+
+final _log = logNamed('discover');
+
+/// The library dependency is a constructor argument (issue #764 candidate 6),
+/// not a later `bindLibraryRepository` call: a runtime rebind is invisible to
+/// in-flight subscribers and left the repository in a half-wired state until
+/// something happened to call it.
+@Riverpod(keepAlive: true)
+DiscoverRepository discoverRepository(Ref ref) {
+  return DiscoverRepository(
+    ref.watch(appDatabaseProvider),
+    feedClient: ref.watch(youtubeFeedClientProvider),
+    libraryRepository: ref.watch(mediaLibraryRepositoryProvider),
+  );
+}
+
+@Riverpod(keepAlive: true)
+Future<List<RecommendedChannel>> recommendedChannels(Ref ref) {
+  return ref.watch(discoverRepositoryProvider).loadRecommendedChannels();
+}
+
+/// When false, recommended channels are filtered to the user's focus learning language.
+@Riverpod(keepAlive: true)
+class DiscoverRecommendedShowAllLanguages
+    extends _$DiscoverRecommendedShowAllLanguages {
+  @override
+  bool build() => false;
+
+  void setShowAll(bool value) => state = value;
+}
+
+@Riverpod(keepAlive: true)
+Future<List<RecommendedChannel>> filteredRecommendedChannels(Ref ref) async {
+  final all = await ref.watch(recommendedChannelsProvider.future);
+  final showAll = ref.watch(discoverRecommendedShowAllLanguagesProvider);
+  if (showAll) return all;
+  final prefs = ref.watch(appPreferencesCtrlProvider).valueOrNull;
+  final focus = prefs?.effectiveLearningLanguage ?? kDefaultLearningLanguageTag;
+  final matched = all
+      .where((c) => matchesLanguageBroad(c.language, focus))
+      .toList(growable: false);
+  return matched.isEmpty ? all : matched;
+}
+
+@Riverpod(keepAlive: true)
+Stream<List<DiscoverChannel>> discoverSubscriptions(Ref ref) {
+  return ref.watch(discoverRepositoryProvider).watchSubscriptions();
+}
+
+/// Waits until [channelId] appears on [discoverSubscriptionsProvider]'s stream.
+Future<void> waitForDiscoverSubscription(
+  DiscoverRepository repository,
+  String channelId,
+) async {
+  if (await repository.getSubscription(channelId) != null) return;
+
+  await repository.watchSubscriptions().firstWhere(
+    (subs) => subs.any((s) => s.channelId == channelId),
+  );
+}
+
+@Riverpod(keepAlive: true)
+Stream<List<FeedEntry>> discoverTimeline(Ref ref) {
+  return ref.watch(discoverRepositoryProvider).watchTimeline();
+}
+
+/// The Discover feed with library membership and channel display fields
+/// already resolved.
+///
+/// Tiles render this instead of probing per item; after "add to library" the
+/// membership arrives through the registry stream, so the manual
+/// `ref.invalidate` the tile used to carry is gone (issue #764 candidate 6).
+@Riverpod(keepAlive: true)
+Stream<List<DiscoverFeedItem>> discoverFeedItems(Ref ref) {
+  return joinLatest3(
+    ref.watch(discoverRepositoryProvider).watchTimeline(),
+    ref.watch(mediaRegistryProvider).watchYoutubeVideoIds(),
+    ref.watch(discoverRepositoryProvider).watchSubscriptions(),
+    projectDiscoverFeedItems,
+  ).distinctBy(listEquals);
+}
+
+@Riverpod(keepAlive: true)
+Stream<List<FeedEntry>> discoverChannelFeed(Ref ref, String channelId) {
+  return ref.watch(discoverRepositoryProvider).watchChannelFeed(channelId);
+}
+
+/// Channel feed with library membership and channel display fields already
+/// resolved — the same join as [discoverFeedItemsProvider], so a
+/// single-channel view gets membership without falling back to per-tile
+/// probes.
+@Riverpod(keepAlive: true)
+Stream<List<DiscoverFeedItem>> discoverChannelFeedItems(
+  Ref ref,
+  String channelId,
+) {
+  return joinLatest3(
+    ref.watch(discoverRepositoryProvider).watchChannelFeed(channelId),
+    ref.watch(mediaRegistryProvider).watchYoutubeVideoIds(),
+    ref.watch(discoverRepositoryProvider).watchSubscriptions(),
+    projectDiscoverFeedItems,
+  ).distinctBy(listEquals);
+}
+
+/// Active Discover feed filter: `null` = all subscribed channels, else one channel.
+@Riverpod(keepAlive: true)
+class DiscoverSelectedChannel extends _$DiscoverSelectedChannel {
+  @override
+  String? build() {
+    ref.listen(discoverSubscriptionsProvider, (previous, next) {
+      final selected = state;
+      if (selected == null) return;
+      final subs = next.valueOrNull;
+      if (subs == null) return;
+      final stillSubscribed = subs.any((s) => s.channelId == selected);
+      if (!stillSubscribed) {
+        state = null;
+      }
+    });
+    return null;
+  }
+
+  void select(String? channelId) {
+    state = channelId;
+  }
+}
+
+/// Channel profile photo for recommended row: subscription avatar, bundled
+/// URL, then a one-time fetch from the public channel page.
+@Riverpod(keepAlive: true)
+Future<String?> recommendedChannelAvatar(Ref ref, String channelId) async {
+  ref.watch(discoverSubscriptionsProvider);
+
+  final subs = ref.watch(discoverSubscriptionsProvider).valueOrNull ?? const [];
+  for (final sub in subs) {
+    if (sub.channelId == channelId &&
+        isRemoteThumbnailUrl(sub.thumbnailUrl) &&
+        !DiscoverRepository.looksLikeVideoThumbnail(sub.thumbnailUrl)) {
+      return sub.thumbnailUrl;
+    }
+  }
+
+  final recommended = await ref.watch(recommendedChannelsProvider.future);
+  for (final channel in recommended) {
+    if (channel.channelId == channelId &&
+        isRemoteThumbnailUrl(channel.thumbnailUrl)) {
+      return channel.thumbnailUrl;
+    }
+  }
+
+  return ref.read(discoverRepositoryProvider).fetchChannelAvatarUrl(channelId);
+}
+
+@Riverpod(keepAlive: true)
+class DiscoverRefreshState extends _$DiscoverRefreshState {
+  /// In-flight refresh future, used for single-flight deduplication.
+  /// `null` when no refresh is currently executing.
+  Future<DiscoverRefreshResult>? _pendingRefresh;
+
+  @override
+  bool build() => false;
+
+  Future<DiscoverRefreshResult> refresh({bool force = false}) async {
+    if (_pendingRefresh != null) {
+      _log.fine('discover refresh already in progress, reusing in-flight');
+      return _pendingRefresh!;
+    }
+
+    state = true;
+    try {
+      _pendingRefresh = ref
+          .read(discoverRepositoryProvider)
+          .refreshFeeds(force: force);
+      return await _pendingRefresh!;
+    } finally {
+      _pendingRefresh = null;
+      state = false;
+    }
+  }
+}
+
+@Riverpod(keepAlive: true)
+class DiscoverFeedRefreshScheduler extends _$DiscoverFeedRefreshScheduler {
+  Timer? _periodic;
+  var _launchScheduled = false;
+
+  @override
+  int build() {
+    ref.onDispose(() {
+      _periodic?.cancel();
+      _periodic = null;
+      _launchScheduled = false;
+    });
+
+    final subList = ref.watch(discoverSubscriptionsProvider).valueOrNull;
+    if (subList != null && subList.isNotEmpty) {
+      _periodic ??= Timer.periodic(const Duration(hours: 8), (_) {
+        if (_isAppResumed) {
+          unawaited(_launchRefresh());
+        } else {
+          _log.fine(
+            'discover feed refresh tick skipped: app is not in foreground',
+          );
+        }
+      });
+
+      if (!_launchScheduled) {
+        _launchScheduled = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_isAppResumed) {
+            unawaited(_launchRefresh());
+          }
+        });
+      }
+    } else {
+      _periodic?.cancel();
+      _periodic = null;
+      _launchScheduled = false;
+    }
+
+    return 0;
+  }
+
+  /// Whether the app is currently in the foreground. Reads
+  /// [WidgetsBinding.lifecycleState] (the global binding) which is
+  /// kept current by the host platform's lifecycle callback bridge.
+  /// `null` is treated as "resumed" so we do not silently skip the
+  /// first refresh on platforms that do not publish a state.
+  bool get _isAppResumed {
+    final state = WidgetsBinding.instance.lifecycleState;
+    return state == null || state == AppLifecycleState.resumed;
+  }
+
+  Future<void> _launchRefresh() async {
+    try {
+      await ref.read(discoverRefreshStateProvider.notifier).refresh();
+    } catch (e, st) {
+      _log.warning('discover feed refresh failed', e, st);
+    }
+  }
+}
+
+Future<String> addDiscoverFeedEntryToLibrary(
+  WidgetRef ref,
+  FeedEntry entry, {
+  String? contentLanguage,
+}) async {
+  final auth = ref.read(authCtrlProvider).valueOrNull;
+  if (auth is! AuthSignedIn) {
+    throw StateError('addDiscoverFeedEntryToLibrary requires AuthSignedIn');
+  }
+  return ref
+      .read(discoverRepositoryProvider)
+      .addFeedEntryToLibrary(entry, contentLanguage: contentLanguage);
+}

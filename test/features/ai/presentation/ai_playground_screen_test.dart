@@ -1,0 +1,555 @@
+import 'dart:typed_data';
+
+import 'package:enjoy_player/core/interaction/enjoy_pressable.dart';
+import 'package:enjoy_player/core/layout/enjoy_page_kind.dart';
+import 'package:enjoy_player/core/theme/widgets/editorial_header.dart';
+import 'package:enjoy_player/core/theme/widgets/empty_state.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_button.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_card.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_icon_tile.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_page.dart';
+import 'package:enjoy_player/features/ai/application/ai_capability_providers.dart';
+import 'package:enjoy_player/features/ai/application/ai_modality_config_controller.dart';
+import 'package:enjoy_player/features/ai/application/ai_modality_configs.dart';
+import 'package:enjoy_player/features/ai/domain/capabilities/asr_capability.dart';
+import 'package:enjoy_player/features/ai/domain/capabilities/assessment_capability.dart';
+import 'package:enjoy_player/features/ai/domain/capabilities/dictionary_capability.dart';
+import 'package:enjoy_player/features/ai/domain/capabilities/llm_capability.dart';
+import 'package:enjoy_player/features/ai/domain/capabilities/translation_capability.dart';
+import 'package:enjoy_player/features/ai/domain/chat_message.dart';
+import 'package:enjoy_player/features/ai/domain/models/asr_request.dart';
+import 'package:enjoy_player/features/ai/domain/models/asr_result.dart';
+import 'package:enjoy_player/features/ai/domain/models/assessment_request.dart';
+import 'package:enjoy_player/features/ai/domain/models/assessment_result.dart';
+import 'package:enjoy_player/features/ai/domain/models/dictionary_result.dart';
+import 'package:enjoy_player/features/ai/domain/models/translation_result.dart';
+import 'package:enjoy_player/features/ai/presentation/ai_playground_screen.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+class _FakeAsr implements AsrCapability {
+  int calls = 0;
+  bool throwOnTranscribe = false;
+
+  @override
+  Future<AsrResult> transcribe(AsrRequest request) async {
+    calls++;
+    if (throwOnTranscribe) {
+      throw StateError('asr boom');
+    }
+    return const AsrResult(text: 'fake asr transcription');
+  }
+}
+
+class _FakeLlm implements LlmCapability {
+  int calls = 0;
+  bool throwOnComplete = false;
+
+  @override
+  Future<String> generateChatCompletion({
+    required List<ChatMessage> messages,
+    double? temperature,
+    int? maxTokens,
+    Map<String, dynamic>? responseFormat,
+  }) async {
+    calls++;
+    if (throwOnComplete) {
+      throw StateError('chat boom');
+    }
+    return 'fake chat reply';
+  }
+
+  @override
+  Future<String> generateText({
+    String? systemPrompt,
+    required String userPrompt,
+    double? temperature,
+    int? maxTokens,
+  }) async {
+    return 'fake text';
+  }
+}
+
+class _FakeTranslation implements TranslationCapability {
+  int calls = 0;
+  bool throwOnTranslate = false;
+
+  @override
+  Future<TranslationResult> translate({
+    required String text,
+    required String sourceLanguage,
+    required String targetLanguage,
+    bool? forceRefresh,
+  }) async {
+    calls++;
+    if (throwOnTranslate) {
+      throw StateError('translate boom');
+    }
+    return const TranslationResult(
+      translatedText: 'fake translation',
+      targetLanguage: 'zh',
+    );
+  }
+}
+
+class _FakeDictionary implements DictionaryCapability {
+  int calls = 0;
+  bool throwOnLookup = false;
+
+  @override
+  Future<DictionaryResult> lookupDictionary({
+    required String word,
+    required String sourceLanguage,
+    required String targetLanguage,
+    bool? forceRefresh,
+  }) async {
+    calls++;
+    if (throwOnLookup) {
+      throw StateError('dictionary boom');
+    }
+    return const DictionaryResult(
+      word: 'fake',
+      sourceLanguage: 'en',
+      targetLanguage: 'zh',
+      senses: <DictionarySense>[],
+    );
+  }
+}
+
+class _FakeAssessment implements AssessmentCapability {
+  int calls = 0;
+
+  @override
+  Future<AssessmentResult> assess(AssessmentRequest request) async {
+    calls++;
+    throw UnimplementedError('not exercised directly in widget tests');
+  }
+}
+
+ProviderContainer _buildContainer({
+  required _FakeAsr asr,
+  required _FakeLlm llm,
+  required _FakeTranslation translation,
+  required _FakeDictionary dictionary,
+}) {
+  return ProviderContainer(
+    overrides: [
+      aiModalityConfigCtrlProvider.overrideWithValue(
+        AiModalityConfigs.defaults,
+      ),
+      asrCapabilityProvider.overrideWithValue(asr),
+      llmCapabilityProvider.overrideWithValue(llm),
+      translationCapabilityProvider.overrideWithValue(translation),
+      dictionaryCapabilityProvider.overrideWithValue(dictionary),
+      assessmentCapabilityProvider.overrideWithValue(_FakeAssessment()),
+    ],
+  );
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('AiPlaygroundScreen widget', () {
+    late _FakeAsr fakeAsr;
+    late _FakeLlm fakeLlm;
+    late _FakeTranslation fakeTranslation;
+    late _FakeDictionary fakeDictionary;
+    late ProviderContainer container;
+
+    Widget wrap() {
+      return UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          localizationsDelegates: [
+            AppLocalizations.delegate,
+            GlobalMaterialLocalizations.delegate,
+            GlobalWidgetsLocalizations.delegate,
+            GlobalCupertinoLocalizations.delegate,
+          ],
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: AiPlaygroundScreen(),
+        ),
+      );
+    }
+
+    setUp(() {
+      fakeAsr = _FakeAsr();
+      fakeLlm = _FakeLlm();
+      fakeTranslation = _FakeTranslation();
+      fakeDictionary = _FakeDictionary();
+      container = _buildContainer(
+        asr: fakeAsr,
+        llm: fakeLlm,
+        translation: fakeTranslation,
+        dictionary: fakeDictionary,
+      );
+    });
+
+    tearDown(() {
+      container.dispose();
+    });
+
+    const phoneSurface = Size(390, 844);
+    const fullPageSurface = Size(1200, 4000);
+
+    Future<AppLocalizations> settle(
+      WidgetTester tester, {
+      Size surface = phoneSurface,
+    }) async {
+      tester.view.physicalSize = surface;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(wrap());
+      await tester.pumpAndSettle();
+      return AppLocalizations.of(
+        tester.element(find.byType(AiPlaygroundScreen)),
+      )!;
+    }
+
+    testWidgets('renders the screen with AppBar', (tester) async {
+      await tester.pumpWidget(wrap());
+      await tester.pumpAndSettle();
+      expect(find.byType(AiPlaygroundScreen), findsOneWidget);
+      expect(find.byType(AppBar), findsOneWidget);
+    });
+
+    testWidgets('lays the page out on the hub page kind', (tester) async {
+      final l10n = await settle(tester);
+      expect(find.byType(EnjoyPage), findsOneWidget);
+      expect(
+        tester.widget<EnjoyPage>(find.byType(EnjoyPage)).kind,
+        EnjoyPageKind.hub,
+      );
+      expect(find.text(l10n.aiPlaygroundTitle), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundIntro), findsOneWidget);
+    });
+
+    testWidgets('uses Aurora surfaces instead of raw Material widgets', (
+      tester,
+    ) async {
+      await settle(tester, surface: fullPageSurface);
+      expect(find.byType(EnjoyCard), findsNWidgets(7));
+      expect(find.byType(EnjoySectionHeader), findsNWidgets(7));
+      expect(find.byType(EnjoyIconTile), findsNWidgets(5));
+      expect(find.byType(EnjoyButton), findsNWidgets(7));
+      expect(find.byType(EnjoyPressable), findsOneWidget);
+      expect(find.byType(Card), findsNothing);
+    });
+
+    testWidgets('groups the five modality sections under section headers', (
+      tester,
+    ) async {
+      final l10n = await settle(tester, surface: fullPageSurface);
+      expect(find.text(l10n.aiPlaygroundSectionAsr), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundSectionChat), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundSectionTranslation), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundSectionDictionary), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundSectionTtsAssessment), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundActiveProviders), findsOneWidget);
+      expect(find.text(l10n.aiPlaygroundOutput), findsWidgets);
+    });
+
+    testWidgets('lists the active provider for every modality', (tester) async {
+      final l10n = await settle(tester, surface: fullPageSurface);
+      expect(find.text(l10n.settingsAiProvidersModalityLlm), findsOneWidget);
+      expect(find.text(l10n.settingsAiProvidersModalityAsr), findsOneWidget);
+      expect(find.text(l10n.settingsAiProvidersModalityTts), findsOneWidget);
+      expect(
+        find.text(l10n.settingsAiProvidersModalityAssessment),
+        findsOneWidget,
+      );
+      expect(find.text(l10n.settingsAiProvidersEnjoyAi), findsNWidgets(9));
+      expect(find.text(l10n.settingsAiProvidersTileTitle), findsOneWidget);
+    });
+
+    testWidgets('renders every modality text field', (tester) async {
+      final l10n = await settle(tester, surface: fullPageSurface);
+      expect(find.byType(TextField), findsNWidgets(10));
+      expect(
+        find.widgetWithText(TextField, l10n.aiPlaygroundChatSystem),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(TextField, l10n.aiPlaygroundDictWord),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('offers one primary run action per section', (tester) async {
+      final l10n = await settle(tester, surface: fullPageSurface);
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundTranscribe),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundSendChat),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundTranslate),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundDictLookup),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundAssess),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundPickAudio),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundClearOutput),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('shows the console empty state until a request runs', (
+      tester,
+    ) async {
+      final l10n = await settle(tester, surface: fullPageSurface);
+      expect(find.byType(EnjoyIconOrb), findsOneWidget);
+      expect(
+        tester
+            .widget<EnjoyButton>(
+              find.widgetWithText(EnjoyButton, l10n.aiPlaygroundClearOutput),
+            )
+            .onPressed,
+        isNull,
+      );
+
+      await tester.tap(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundSendChat),
+      );
+      await tester.pumpAndSettle();
+
+      expect(fakeLlm.calls, 1);
+      expect(find.byType(EnjoyIconOrb), findsNothing);
+      expect(find.textContaining('fake chat reply'), findsOneWidget);
+      expect(
+        tester
+            .widget<EnjoyButton>(
+              find.widgetWithText(EnjoyButton, l10n.aiPlaygroundClearOutput),
+            )
+            .onPressed,
+        isNotNull,
+      );
+
+      await tester.tap(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundClearOutput),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('fake chat reply'), findsNothing);
+      expect(find.byType(EnjoyIconOrb), findsOneWidget);
+    });
+
+    testWidgets('appends an error entry when a modality call fails', (
+      tester,
+    ) async {
+      fakeLlm.throwOnComplete = true;
+      final l10n = await settle(tester, surface: fullPageSurface);
+
+      await tester.tap(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundSendChat),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('chat boom'), findsOneWidget);
+    });
+
+    testWidgets('keeps every section reachable by scrolling at phone size', (
+      tester,
+    ) async {
+      final l10n = await settle(tester);
+      await tester.scrollUntilVisible(
+        find.byType(EnjoyIconOrb),
+        300,
+        scrollable: find.byType(Scrollable).first,
+      );
+
+      expect(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundClearOutput),
+        findsOneWidget,
+      );
+      expect(find.byType(EnjoyIconOrb), findsOneWidget);
+    });
+
+    testWidgets('renders the newest entry first', (tester) async {
+      final l10n = await settle(tester, surface: fullPageSurface);
+
+      await tester.tap(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundSendChat),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(EnjoyButton, l10n.aiPlaygroundTranslate),
+      );
+      await tester.pumpAndSettle();
+
+      final texts = tester
+          .widgetList<SelectableText>(find.byType(SelectableText))
+          .map((entry) => entry.data ?? '')
+          .toList(growable: false);
+      expect(texts.first, contains('fake translation'));
+      expect(texts[1], contains('fake chat reply'));
+    });
+
+    testWidgets('caps the console and builds its entries lazily', (
+      tester,
+    ) async {
+      final l10n = await settle(tester);
+      final chatButton = find.widgetWithText(
+        EnjoyButton,
+        l10n.aiPlaygroundSendChat,
+      );
+      final translateButton = find.widgetWithText(
+        EnjoyButton,
+        l10n.aiPlaygroundTranslate,
+      );
+
+      await tester.ensureVisible(chatButton);
+      await tester.tap(chatButton);
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(translateButton);
+      for (var i = 0; i < 206; i++) {
+        await tester.tap(translateButton);
+        await tester.pumpAndSettle();
+      }
+
+      final pagePosition = tester
+          .state<ScrollableState>(find.byType(Scrollable).first)
+          .position;
+      pagePosition.jumpTo(pagePosition.maxScrollExtent);
+      await tester.pumpAndSettle();
+
+      final consoleList = find.descendant(
+        of: find.byType(EnjoyCard),
+        matching: find.byType(ListView),
+      );
+      final delegate =
+          tester.widget<ListView>(consoleList).childrenDelegate
+              as SliverChildBuilderDelegate;
+      expect(delegate.childCount, 200);
+      expect(find.byType(SelectableText), findsWidgets);
+      expect(
+        tester.widgetList<SelectableText>(find.byType(SelectableText)).length,
+        lessThan(30),
+      );
+    });
+  });
+
+  group('Capability fakes', () {
+    test('AsrCapability.transcribe returns fake result', () async {
+      final asr = _FakeAsr();
+      final r = await asr.transcribe(
+        AsrRequest(
+          audioBytes: Uint8List.fromList(const [1, 2, 3]),
+          filename: 't.wav',
+        ),
+      );
+      expect(r.text, 'fake asr transcription');
+      expect(asr.calls, 1);
+    });
+
+    test('AsrCapability throws when configured', () async {
+      final asr = _FakeAsr()..throwOnTranscribe = true;
+      await expectLater(
+        () => asr.transcribe(
+          AsrRequest(
+            audioBytes: Uint8List.fromList(const [1]),
+            filename: 't.wav',
+          ),
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('LlmCapability.generateChatCompletion returns fake text', () async {
+      final llm = _FakeLlm();
+      final r = await llm.generateChatCompletion(
+        messages: const <ChatMessage>[],
+      );
+      expect(r, 'fake chat reply');
+      expect(llm.calls, 1);
+    });
+
+    test('LlmCapability.generateText returns fake text', () async {
+      final llm = _FakeLlm();
+      final r = await llm.generateText(userPrompt: 'hi');
+      expect(r, 'fake text');
+    });
+
+    test('LlmCapability throws when configured', () async {
+      final llm = _FakeLlm()..throwOnComplete = true;
+      await expectLater(
+        () => llm.generateChatCompletion(messages: const <ChatMessage>[]),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('TranslationCapability.translate returns fake result', () async {
+      final t = _FakeTranslation();
+      final r = await t.translate(
+        text: 'hi',
+        sourceLanguage: 'en',
+        targetLanguage: 'zh',
+      );
+      expect(r.translatedText, 'fake translation');
+      expect(t.calls, 1);
+    });
+
+    test('TranslationCapability throws when configured', () async {
+      final t = _FakeTranslation()..throwOnTranslate = true;
+      await expectLater(
+        () =>
+            t.translate(text: 'hi', sourceLanguage: 'en', targetLanguage: 'zh'),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('DictionaryCapability.lookupDictionary returns fake result', () async {
+      final d = _FakeDictionary();
+      final r = await d.lookupDictionary(
+        word: 'hi',
+        sourceLanguage: 'en',
+        targetLanguage: 'zh',
+      );
+      expect(r.word, 'fake');
+      expect(d.calls, 1);
+    });
+
+    test('DictionaryCapability throws when configured', () async {
+      final d = _FakeDictionary()..throwOnLookup = true;
+      await expectLater(
+        () => d.lookupDictionary(
+          word: 'hi',
+          sourceLanguage: 'en',
+          targetLanguage: 'zh',
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('AssessmentCapability.assess throws UnimplementedError', () async {
+      final a = _FakeAssessment();
+      await expectLater(
+        () => a.assess(
+          AssessmentRequest(
+            audioBytes: Uint8List.fromList(const [1]),
+            referenceText: 'hi',
+            language: 'en',
+          ),
+        ),
+        throwsA(isA<UnimplementedError>()),
+      );
+      expect(a.calls, 1);
+    });
+  });
+}

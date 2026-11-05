@@ -1,0 +1,300 @@
+/// Decode Craft audio bytes to 16 kHz mono Float32 for forced alignment.
+library;
+
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
+
+import 'package:enjoy_player/core/audio/wav_chunks.dart';
+import 'package:enjoy_player/core/logging/log.dart';
+import 'package:enjoy_player/data/files/ffmpeg_argv_runner.dart';
+import 'package:enjoy_player/data/files/ffmpeg_media_probe.dart';
+import 'package:flutter/foundation.dart';
+import 'package:forced_alignment/forced_alignment.dart';
+
+final _log = logNamed('audio.pcm16k');
+
+/// Thrown when Craft bytes cannot be decoded to 16 kHz mono PCM.
+final class Pcm16kDecodeException implements Exception {
+  const Pcm16kDecodeException(this.message);
+  final String message;
+
+  @override
+  String toString() => 'Pcm16kDecodeException($message)';
+}
+
+/// Turns WAV (or other FFmpeg-decodable) bytes into 16 kHz mono [Float32List].
+///
+/// PCM WAV is decoded in-process inside a worker isolate (the frame×channel
+/// parse loop and per-sample resample never touch the UI isolate). Other
+/// encodings fall back to a temp-file FFmpeg convert (`pcm_s16le -ar 16000
+/// -ac 1`): CLI when a binary is on PATH (Windows bundled / Linux),
+/// otherwise FFmpegKit (Android / iOS / macOS). Does not import ASR.
+Future<Float32List> decodeToPcm16kMono(Uint8List bytes) async {
+  final inProcess = await Isolate.run(
+    () => decodePcmWavTo16kMono(bytes),
+    debugName: 'pcm16k-wav-decode',
+  );
+  if (inProcess != null && inProcess.isNotEmpty) {
+    return inProcess;
+  }
+  return _ffmpegFallback(bytes);
+}
+
+/// True when [pathOrUri] is an HTTP(S) URL (owned cloud library).
+///
+/// FFmpeg must not fetch these: download with Dart HTTP first, then decode
+/// the local file (FFmpegKit TLS is unreliable across Android/iOS/macOS).
+bool pcm16kInputIsRemoteHttp(String pathOrUri) {
+  final uri = Uri.tryParse(pathOrUri);
+  if (uri == null) return false;
+  return uri.isScheme('http') || uri.isScheme('https');
+}
+
+/// Decode a local media [pathOrUri] to 16 kHz mono Float32.
+///
+/// The whole-file read plus WAV parse plus resample run inside a worker
+/// isolate; when the file is not an in-process-decodable PCM WAV, FFmpeg
+/// receives the file **path** directly (no multi-hundred-MB byte round-trip
+/// through the UI isolate).
+Future<Float32List> decodeFileToPcm16kMono(String pathOrUri) async {
+  final input = FfmpegMediaProbe.mediaInputForFfmpeg(pathOrUri);
+  if (pcm16kInputIsRemoteHttp(input)) {
+    throw Pcm16kDecodeException(
+      'HTTP(S) media must be downloaded locally before FFmpeg: $input',
+    );
+  }
+  final file = File(input);
+  if (!file.existsSync()) {
+    throw Pcm16kDecodeException('file does not exist: $input');
+  }
+  final inProcess = await Isolate.run(
+    () => _decodeWavFileTo16kMono(input),
+    debugName: 'pcm16k-file-decode',
+  );
+  if (inProcess != null && inProcess.isNotEmpty) {
+    return inProcess;
+  }
+  return _ffmpegConvertInputToPcm(input, failLabel: 'convert');
+}
+
+/// Decode a time window of a local media file to 16 kHz mono Float32.
+///
+/// Uses **FFmpegKit** on Android / iOS / macOS. Windows and Linux run a CLI
+/// `ffmpeg` (bundled next to the app, or on PATH).
+Future<Float32List> decodeFileWindowToPcm16kMono({
+  required String pathOrUri,
+  required double startSeconds,
+  required double durationSeconds,
+}) async {
+  final input = FfmpegMediaProbe.mediaInputForFfmpeg(pathOrUri);
+  if (pcm16kInputIsRemoteHttp(input)) {
+    throw Pcm16kDecodeException(
+      'HTTP(S) media must be downloaded locally before FFmpeg: $input',
+    );
+  }
+  if (!File(input).existsSync()) {
+    throw Pcm16kDecodeException('file does not exist: $input');
+  }
+  final start = startSeconds < 0 ? 0.0 : startSeconds;
+  final duration = durationSeconds <= 0 ? 0.05 : durationSeconds;
+  final dir = await Directory.systemTemp.createTemp('enjoy_pcm16k_win_');
+  try {
+    final output = File('${dir.path}${Platform.pathSeparator}out.wav');
+    await _runFfmpegToWav(
+      input: input,
+      outputPath: output.path,
+      startSeconds: start,
+      durationSeconds: duration,
+      failLabel: 'window extract',
+    );
+    final outputPath = output.path;
+    final decoded = await Isolate.run(
+      () => _decodeWavFileTo16kMono(outputPath),
+      debugName: 'pcm16k-wav-decode',
+    );
+    if (decoded == null || decoded.isEmpty) {
+      throw const Pcm16kDecodeException('ffmpeg window output was not PCM WAV');
+    }
+    return decoded;
+  } finally {
+    try {
+      await dir.delete(recursive: true);
+    } on Object catch (_) {}
+  }
+}
+
+/// In-process RIFF WAVE decode + mix-to-mono + resample. Returns null when
+/// the payload is not a supported PCM/float WAV.
+Float32List? decodePcmWavTo16kMono(Uint8List bytes) {
+  final parsed = _parseWav(bytes);
+  if (parsed == null || parsed.samples.isEmpty) return null;
+  return resampleToAlignmentRate(parsed.samples, parsed.sampleRate);
+}
+
+Float32List? _decodeWavFileTo16kMono(String path) {
+  return decodePcmWavTo16kMono(File(path).readAsBytesSync());
+}
+
+Future<Float32List> _ffmpegFallback(Uint8List bytes) async {
+  final dir = await Directory.systemTemp.createTemp('enjoy_pcm16k_');
+  try {
+    final input = File('${dir.path}${Platform.pathSeparator}in.bin');
+    await input.writeAsBytes(bytes, flush: true);
+    return await _ffmpegConvertInputToPcm(input.path, failLabel: 'convert');
+  } finally {
+    try {
+      await dir.delete(recursive: true);
+    } on Object catch (_) {}
+  }
+}
+
+/// FFmpeg `-i` [input] (local path or HTTP URL) → 16 kHz mono PCM.
+Future<Float32List> _ffmpegConvertInputToPcm(
+  String input, {
+  required String failLabel,
+}) async {
+  final dir = await Directory.systemTemp.createTemp('enjoy_pcm16k_in_');
+  try {
+    final output = File('${dir.path}${Platform.pathSeparator}out.wav');
+    await _runFfmpegToWav(
+      input: input,
+      outputPath: output.path,
+      failLabel: failLabel,
+    );
+    final outputPath = output.path;
+    final decoded = await Isolate.run(
+      () => _decodeWavFileTo16kMono(outputPath),
+      debugName: 'pcm16k-wav-decode',
+    );
+    if (decoded == null || decoded.isEmpty) {
+      throw const Pcm16kDecodeException('ffmpeg output was not PCM WAV');
+    }
+    return decoded;
+  } finally {
+    try {
+      await dir.delete(recursive: true);
+    } on Object catch (_) {}
+  }
+}
+
+/// Android / iOS / macOS ship FFmpegKit. Windows / Linux use a CLI binary.
+@visibleForTesting
+bool pcm16kUsesFfmpegKit({
+  required bool isAndroid,
+  required bool isIOS,
+  required bool isMacOS,
+}) => isAndroid || isIOS || isMacOS;
+
+/// Windows/Linux: bundled or PATH `ffmpeg`. Android/iOS/macOS: FFmpegKit
+/// (there is no CLI binary in those app packages).
+Future<void> _runFfmpegToWav({
+  required String input,
+  required String outputPath,
+  required String failLabel,
+  double? startSeconds,
+  double? durationSeconds,
+}) async {
+  final args = <String>[
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    if (startSeconds != null) ...['-ss', startSeconds.toStringAsFixed(3)],
+    if (durationSeconds != null) ...['-t', durationSeconds.toStringAsFixed(3)],
+    '-i',
+    input,
+    '-vn',
+    '-ar',
+    '$kAlignmentSampleRate',
+    '-ac',
+    '1',
+    '-c:a',
+    'pcm_s16le',
+    outputPath,
+  ];
+
+  final result = await runFfmpegArgv(
+    args: args,
+    failLabel: failLabel,
+    outputPath: outputPath,
+  );
+  if (!result.succeeded) {
+    _log.fine('ffmpeg $failLabel failed (${result.outcome.name})');
+    throw Pcm16kDecodeException(
+      'ffmpeg $failLabel failed (${result.outcome.name})',
+    );
+  }
+  if (!File(outputPath).existsSync()) {
+    _log.fine('ffmpeg $failLabel produced no output file');
+    throw Pcm16kDecodeException('ffmpeg $failLabel produced no output file');
+  }
+}
+
+final class _ParsedWav {
+  const _ParsedWav({required this.sampleRate, required this.samples});
+  final int sampleRate;
+  final Float32List samples;
+}
+
+_ParsedWav? _parseWav(Uint8List bytes) {
+  final chunks = readWavChunks(bytes);
+  if (chunks == null) return null;
+
+  final format = chunks.fmt.audioFormat;
+  final channels = chunks.fmt.numChannels;
+  final rate = chunks.fmt.sampleRate;
+  final bits = chunks.fmt.bitsPerSample;
+  final align = chunks.fmt.blockAlign;
+  if (channels <= 0 || rate <= 0 || align <= 0) return null;
+
+  final end = math.min(chunks.dataStart + chunks.dataSize, bytes.length);
+  final data = bytes.sublist(chunks.dataStart, end);
+  final frames = data.length ~/ align;
+  if (frames <= 0) return null;
+
+  final samples = Float32List(frames);
+  switch (format) {
+    case 1:
+      if (bits == 16 && align == 2 * channels) {
+        for (var i = 0; i < frames; i++) {
+          var sum = 0.0;
+          for (var ch = 0; ch < channels; ch++) {
+            final off = i * align + ch * 2;
+            final s = data[off] | (data[off + 1] << 8);
+            sum += (s > 32767 ? s - 65536 : s) / 32768.0;
+          }
+          samples[i] = sum / channels;
+        }
+        return _ParsedWav(sampleRate: rate, samples: samples);
+      }
+      if (bits == 32 && align == 4 * channels) {
+        final bd = ByteData.sublistView(data);
+        for (var i = 0; i < frames; i++) {
+          var sum = 0.0;
+          for (var ch = 0; ch < channels; ch++) {
+            final off = i * align + ch * 4;
+            sum += bd.getInt32(off, Endian.little) / 2147483648.0;
+          }
+          samples[i] = sum / channels;
+        }
+        return _ParsedWav(sampleRate: rate, samples: samples);
+      }
+      return null;
+    case 3:
+      if (bits == 32 && align == 4 * channels) {
+        final bd = ByteData.sublistView(data);
+        for (var i = 0; i < frames; i++) {
+          var sum = 0.0;
+          for (var ch = 0; ch < channels; ch++) {
+            final off = i * align + ch * 4;
+            sum += bd.getFloat32(off, Endian.little);
+          }
+          samples[i] = sum / channels;
+        }
+        return _ParsedWav(sampleRate: rate, samples: samples);
+      }
+      return null;
+    default:
+      return null;
+  }
+}

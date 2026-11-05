@@ -1,0 +1,511 @@
+/// Import + relink policy for library media (oEmbed resolution, placeholder
+/// detection, hashing, storage GC, delete/language transaction policy).
+///
+/// Reads and row writes cross the [MediaRegistry] seam directly — this module
+/// no longer relays them (issue #765). The whole-library watch lives on the
+/// registry (`MediaRegistry.watchAll`, issue #753).
+library;
+
+import 'dart:async';
+
+import 'package:cross_file/cross_file.dart';
+
+import 'package:enjoy_player/core/application/app_language_catalog.dart';
+import 'package:enjoy_player/core/errors/app_failure.dart';
+import 'package:enjoy_player/core/ids/enjoy_ids.dart';
+import 'package:enjoy_player/core/logging/log.dart';
+import 'package:enjoy_player/core/utils/youtube_video_identity.dart';
+import 'package:logging/logging.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/media_registry.dart';
+import 'package:enjoy_player/data/files/app_managed_media_gc.dart';
+import 'package:enjoy_player/data/files/file_storage.dart';
+import 'package:enjoy_player/data/files/media_duration_probe.dart';
+import 'package:enjoy_player/data/files/media_resolver.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+import 'package:enjoy_player/features/library/data/youtube_oembed_api.dart';
+import 'package:enjoy_player/features/sync/domain/sync_types.dart';
+import 'package:http/http.dart' as http;
+
+typedef YoutubeMetadataPatch = ({String title, String? thumbnailUrl});
+
+class MediaLibraryRepository {
+  MediaLibraryRepository(
+    AppDatabase db,
+    this._storage, {
+    this._enqueueSync,
+    this._oembedClient,
+  }) : _db = db,
+       _registry = MediaRegistry(db);
+
+  static final Logger _log = logNamed('library.repository');
+
+  final AppDatabase _db;
+  final FileStorage _storage;
+  final SyncEnqueueFn? _enqueueSync;
+  final http.Client? _oembedClient;
+
+  /// The registry is `const`-constructible and stateless; one field replaces
+  /// the per-call constructions this file used to spell (issue #765).
+  final MediaRegistry _registry;
+
+  /// Imports a local file into the signed-in user's library.
+  Future<String> importMedia(
+    XFile file, {
+    required String signedInUserId,
+    String contentLanguage = kUnknownMediaLanguageTag,
+  }) async {
+    try {
+      if (!isImportableLocalMediaFileName(file.name)) {
+        throw const UnsupportedImportFileFailure();
+      }
+      final result = await _storage.importOrLinkPickedFile(file);
+      final kind = isVideoFileName(file.name)
+          ? MediaKind.video
+          : MediaKind.audio;
+      return await _importLocalFile(
+        kind: kind,
+        result: result,
+        signedInUserId: signedInUserId,
+        contentLanguage: contentLanguage,
+      );
+    } on AppFailure {
+      rethrow;
+    } catch (e, st) {
+      Error.throwWithStackTrace(FileFailure('Import failed: $e'), st);
+    }
+  }
+
+  Future<String> _importLocalFile({
+    required MediaKind kind,
+    required FileImportResult result,
+    required String signedInUserId,
+    required String contentLanguage,
+  }) async {
+    final now = DateTime.now();
+    final contentHash = result.contentHashHex;
+    final language = canonicalMediaLanguageTag(contentLanguage);
+    final isVideo = kind == MediaKind.video;
+
+    final contentKey = isVideo
+        ? enjoyLocalVideoVid(
+            contentHashHex: contentHash,
+            userId: signedInUserId,
+          )
+        : enjoyLocalAudioAid(
+            contentHashHex: contentHash,
+            userId: signedInUserId,
+          );
+    final id = isVideo
+        ? enjoyVideoId(vid: contentKey)
+        : enjoyAudioId(aid: contentKey);
+    final existingVideo = isVideo ? await _registry.getVideoById(id) : null;
+    final existingAudio = isVideo ? null : await _registry.getAudioById(id);
+    final isUpdate = existingVideo != null || existingAudio != null;
+    final previousUri = existingVideo?.localUri ?? existingAudio?.localUri;
+    final description =
+        existingVideo?.description ?? existingAudio?.description;
+    final thumbnailUrl =
+        existingVideo?.thumbnailUrl ?? existingAudio?.thumbnailUrl;
+    final durationSeconds =
+        existingVideo?.durationSeconds ?? existingAudio?.durationSeconds ?? 0;
+    final source = existingVideo?.source ?? existingAudio?.source;
+    final mediaUrl = existingVideo?.mediaUrl ?? existingAudio?.mediaUrl;
+    final serverUpdatedAt =
+        existingVideo?.serverUpdatedAt ?? existingAudio?.serverUpdatedAt;
+    final createdAt =
+        existingVideo?.createdAt ?? existingAudio?.createdAt ?? now;
+
+    if (isVideo) {
+      await _registry.upsertVideo(
+        VideoRow(
+          id: id,
+          vid: contentKey,
+          provider: 'user',
+          title: result.title,
+          description: description,
+          thumbnailUrl: thumbnailUrl,
+          durationSeconds: durationSeconds,
+          language: language,
+          source: source,
+          localUri: result.fileUri,
+          bookmarkData: result.bookmarkData,
+          md5: contentHash,
+          size: result.fileSize,
+          localMtimeMs: result.mtimeMs,
+          mediaUrl: mediaUrl,
+          syncStatus: 'pending',
+          serverUpdatedAt: serverUpdatedAt,
+          createdAt: createdAt,
+          updatedAt: now,
+        ),
+      );
+    } else {
+      await _registry.upsertAudio(
+        AudioRow(
+          id: id,
+          aid: contentKey,
+          provider: 'user',
+          title: result.title,
+          description: description,
+          thumbnailUrl: thumbnailUrl,
+          durationSeconds: durationSeconds,
+          language: language,
+          translationKey: existingAudio?.translationKey,
+          sourceText: existingAudio?.sourceText,
+          voice: existingAudio?.voice,
+          source: source,
+          localUri: result.fileUri,
+          bookmarkData: result.bookmarkData,
+          md5: contentHash,
+          size: result.fileSize,
+          localMtimeMs: result.mtimeMs,
+          mediaUrl: mediaUrl,
+          syncStatus: 'pending',
+          serverUpdatedAt: serverUpdatedAt,
+          createdAt: createdAt,
+          updatedAt: now,
+        ),
+      );
+    }
+
+    return _finalizeLocalImport(
+      id: id,
+      previousUri: previousUri,
+      fileUri: result.fileUri,
+      entityType: MediaRegistry.syncEntityTypeOf(kind),
+      isUpdate: isUpdate,
+    );
+  }
+
+  /// Imports a YouTube video by pasted URL or bare video id.
+  Future<String> importYoutubeVideo(
+    String rawInput, {
+    String? prefetchedTitle,
+    String? prefetchedThumbnailUrl,
+    String contentLanguage = kUnknownMediaLanguageTag,
+  }) async {
+    final id = parseYoutubeVideoId(rawInput);
+    if (id == null) {
+      throw const FileFailure('Invalid YouTube URL or video ID.');
+    }
+    final dup = await _registry.getYoutubeVideoByVid(id);
+    if (dup != null) {
+      await _maybePatchYoutubeMetadata(
+        dup,
+        prefetchedTitle: prefetchedTitle,
+        prefetchedThumbnailUrl: prefetchedThumbnailUrl,
+      );
+      await _registry.touchUpdatedAt(dup.id);
+      return dup.id;
+    }
+
+    final oembed = await fetchYoutubeOembed(id, client: _oembedClient);
+    final title = _resolveYoutubeTitle(
+      id,
+      prefetchedTitle: prefetchedTitle,
+      oembed: oembed,
+    );
+    final thumb = _resolveYoutubeThumbnail(
+      prefetchedThumbnailUrl: prefetchedThumbnailUrl,
+      oembed: oembed,
+    );
+
+    final rowId = enjoyVideoId(provider: 'youtube', vid: id);
+    final now = DateTime.now();
+
+    final row = VideoRow(
+      id: rowId,
+      vid: id,
+      provider: 'youtube',
+      title: title,
+      description: null,
+      thumbnailUrl: thumb,
+      durationSeconds: 0,
+      language: canonicalMediaLanguageTag(contentLanguage),
+      source: 'youtube',
+      localUri: null,
+      md5: null,
+      size: null,
+      mediaUrl: 'https://www.youtube.com/watch?v=$id',
+      syncStatus: 'pending',
+      serverUpdatedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    );
+    await _registry.upsertVideo(row);
+    await _enqueueSync?.call(SyncEntityType.video, rowId, SyncAction.create);
+    return rowId;
+  }
+
+  /// Re-fetches oEmbed when title/thumbnail are still import placeholders.
+  ///
+  /// A stored non-placeholder title is kept — the refresh never reverts a
+  /// user rename (issue #923); it fills the placeholder and backfills a
+  /// missing thumbnail.
+  Future<YoutubeMetadataPatch?> refreshYoutubeMetadataIfNeeded(
+    String mediaId,
+  ) async {
+    final row = await _registry.getVideoById(mediaId);
+    if (row == null || row.provider.toLowerCase() != 'youtube') return null;
+    if (!_youtubeMetadataNeedsRefresh(row)) return null;
+
+    final meta = await fetchYoutubeOembed(row.vid, client: _oembedClient);
+    if (meta == null) return null;
+
+    final needsTitle = isYoutubeImportPlaceholderTitle(row.title, row.vid);
+    final title = needsTitle ? meta.title : row.title;
+    final thumb = meta.thumbnailUrl ?? row.thumbnailUrl;
+    if (title == row.title && thumb == row.thumbnailUrl) return null;
+
+    await _registry.updateYoutubeMetadata(
+      id: mediaId,
+      title: title,
+      thumbnailUrl: thumb,
+    );
+    await _enqueueYoutubeMetadataSync(row);
+    return (title: title, thumbnailUrl: thumb);
+  }
+
+  bool _youtubeMetadataNeedsRefresh(VideoRow row) {
+    return isYoutubeImportPlaceholderTitle(row.title, row.vid) ||
+        row.thumbnailUrl == null ||
+        row.thumbnailUrl!.trim().isEmpty;
+  }
+
+  String _resolveYoutubeTitle(
+    String vid, {
+    String? prefetchedTitle,
+    YoutubeOembedMetadata? oembed,
+  }) {
+    final pref = prefetchedTitle?.trim();
+    if (pref != null &&
+        pref.isNotEmpty &&
+        !isYoutubeImportPlaceholderTitle(pref, vid)) {
+      return pref;
+    }
+    return oembed?.title ?? youtubeImportPlaceholderTitle(vid);
+  }
+
+  String? _resolveYoutubeThumbnail({
+    String? prefetchedThumbnailUrl,
+    YoutubeOembedMetadata? oembed,
+  }) {
+    final pref = prefetchedThumbnailUrl?.trim();
+    if (pref != null && pref.isNotEmpty) return pref;
+    return oembed?.thumbnailUrl;
+  }
+
+  Future<void> _maybePatchYoutubeMetadata(
+    VideoRow row, {
+    String? prefetchedTitle,
+    String? prefetchedThumbnailUrl,
+  }) async {
+    if (!_youtubeMetadataNeedsRefresh(row)) return;
+
+    final oembed = await fetchYoutubeOembed(row.vid, client: _oembedClient);
+    final title = _resolveYoutubeTitle(
+      row.vid,
+      prefetchedTitle: prefetchedTitle,
+      oembed: oembed,
+    );
+    final needsTitle =
+        isYoutubeImportPlaceholderTitle(row.title, row.vid) &&
+        !isYoutubeImportPlaceholderTitle(title, row.vid);
+    final thumb = _resolveYoutubeThumbnail(
+      prefetchedThumbnailUrl: prefetchedThumbnailUrl,
+      oembed: oembed,
+    );
+    final needsThumb =
+        (row.thumbnailUrl == null || row.thumbnailUrl!.trim().isEmpty) &&
+        thumb != null &&
+        thumb.isNotEmpty;
+    if (!needsTitle && !needsThumb) return;
+
+    final resolvedTitle = needsTitle ? title : row.title;
+    final resolvedThumb = needsThumb ? thumb : row.thumbnailUrl;
+    await _registry.updateYoutubeMetadata(
+      id: row.id,
+      title: resolvedTitle,
+      thumbnailUrl: resolvedThumb,
+    );
+    await _enqueueYoutubeMetadataSync(row);
+  }
+
+  Future<void> _enqueueYoutubeMetadataSync(VideoRow row) async {
+    final status = row.syncStatus?.trim();
+    if (status == null || status.isEmpty) return;
+    await _enqueueSync?.call(SyncEntityType.video, row.id, SyncAction.update);
+  }
+
+  /// Bumps library-row [updatedAt] so Home "Recent media" ranks recently opened
+  /// items without enqueueing a cloud sync update.
+  ///
+  /// Failures are swallowed (logged) so fire-and-forget callers from
+  /// [PlayerController.openMedia] cannot fail tests or tear-down when the DB
+  /// is already closed.
+  Future<void> touchMediaUpdatedAt(String mediaId) async {
+    try {
+      await _registry.touchUpdatedAt(mediaId);
+    } on Object catch (e, st) {
+      _log.warning('touchMediaUpdatedAt failed for $mediaId', e, st);
+    }
+  }
+
+  Future<void> deleteMedia(String id) async {
+    String? localUri;
+    await _db.transaction(() async {
+      localUri = await _registry.localUriOf(id);
+      final kind = await _registry.deleteById(id);
+      if (kind != null) {
+        await _enqueueSync?.call(
+          MediaRegistry.syncEntityTypeOf(kind),
+          id,
+          SyncAction.delete,
+        );
+      }
+    });
+    await _maybeDeleteAppManagedMedia(localUri);
+  }
+
+  Future<void> _maybeDeleteAppManagedMedia(String? fileUri) {
+    return deleteAppManagedMediaIfUnreferenced(
+      db: _db,
+      storage: _storage,
+      fileUri: fileUri,
+    );
+  }
+
+  /// Updates content language on an existing audio or video row.
+  Future<void> updateMediaLanguage(String id, String language) async {
+    final canonical = canonicalMediaLanguageTag(language);
+    final hit = await _registry.probeBoth(id);
+    final current = hit.video?.language ?? hit.audio?.language;
+    if (hit.video == null && hit.audio == null) {
+      throw const FileFailure('Media not found.');
+    }
+    if (tagsEqual(current!, canonical)) return;
+    final kind = await _registry.updateLanguage(id, canonical, probed: hit);
+    if (kind == null) throw const FileFailure('Media not found.');
+    if (kind == MediaKind.video) {
+      await _db.transcriptFetchStateDao.clearForTarget('video', id);
+    }
+    await _enqueueSync?.call(
+      MediaRegistry.syncEntityTypeOf(kind),
+      id,
+      SyncAction.update,
+    );
+  }
+
+  /// Renames an existing audio or video row.
+  ///
+  /// This method owns the input contract: [title] is trimmed, a blank title
+  /// throws [FileFailure], a row that already holds the trimmed title is a
+  /// no-op, and a missing row throws [FileFailure]. Title changes do not
+  /// touch transcript fetch state (unlike [updateMediaLanguage]) — only the
+  /// sync queue is notified so other devices pick the new title up.
+  Future<void> updateMediaTitle(String id, String title) async {
+    final trimmed = title.trim();
+    if (trimmed.isEmpty) {
+      throw const FileFailure('Title cannot be empty.');
+    }
+    final hit = await _registry.probeBoth(id);
+    final current = hit.video?.title ?? hit.audio?.title;
+    if (hit.video == null && hit.audio == null) {
+      throw const FileFailure('Media not found.');
+    }
+    if (current == trimmed) return;
+    final kind = await _registry.updateTitle(id, trimmed, probed: hit);
+    if (kind == null) throw const FileFailure('Media not found.');
+    await _enqueueSync?.call(
+      MediaRegistry.syncEntityTypeOf(kind),
+      id,
+      SyncAction.update,
+    );
+  }
+
+  /// Link or copy a user-picked file when its chunked SHA-256 matches the
+  /// row's `md5` field, then set [localUri] for playback on this device.
+  Future<void> relocateLocalFile({
+    required String mediaId,
+    required XFile picked,
+  }) async {
+    try {
+      final hit = await _registry.probeBoth(mediaId);
+      final video = hit.video;
+      final audio = hit.audio;
+      if (video == null && audio == null) {
+        throw const FileFailure('Media not found.');
+      }
+      final kind = video != null ? MediaKind.video : MediaKind.audio;
+      await _relocateLinkedFile(
+        mediaId: mediaId,
+        md5: video?.md5 ?? audio?.md5,
+        previousUri: video?.localUri ?? audio?.localUri,
+        kind: kind,
+        picked: picked,
+        persist: (result) async {
+          await _registry.updateLocalFile(
+            mediaId,
+            localUri: result.fileUri,
+            bookmarkData: result.bookmarkData,
+            size: result.fileSize,
+            mtimeMs: result.mtimeMs,
+          );
+        },
+      );
+    } on AppFailure {
+      rethrow;
+    } catch (e, st) {
+      Error.throwWithStackTrace(FileFailure('Relocate failed: $e'), st);
+    }
+  }
+
+  Future<String> _finalizeLocalImport({
+    required String id,
+    required String? previousUri,
+    required String fileUri,
+    required SyncEntityType entityType,
+    required bool isUpdate,
+  }) async {
+    if (previousUri != null && previousUri != fileUri) {
+      await _maybeDeleteAppManagedMedia(previousUri);
+    }
+    unawaited(probeAndPatchMediaDuration(_db, id, fileUri));
+    await _enqueueSync?.call(
+      entityType,
+      id,
+      isUpdate ? SyncAction.update : SyncAction.create,
+    );
+    return id;
+  }
+
+  Future<void> _relocateLinkedFile({
+    required String mediaId,
+    required String? md5,
+    required String? previousUri,
+    required MediaKind kind,
+    required XFile picked,
+    required Future<void> Function(FileImportResult result) persist,
+  }) async {
+    final hash = md5;
+    if (hash == null || hash.isEmpty) {
+      throw const FileFailure(
+        'Cannot locate file: this item has no content fingerprint.',
+      );
+    }
+    final result = await _storage.importOrLinkPickedFile(
+      picked,
+      expectedHashHex: hash,
+    );
+    await persist(result);
+    if (previousUri != null && previousUri != result.fileUri) {
+      await _maybeDeleteAppManagedMedia(previousUri);
+    }
+    await _enqueueSync?.call(
+      MediaRegistry.syncEntityTypeOf(kind),
+      mediaId,
+      SyncAction.update,
+    );
+  }
+}

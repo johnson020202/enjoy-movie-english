@@ -1,0 +1,12 @@
+{
+  "channels": [
+    {
+      "channelId": "UCAuUUnT6oDeKwE6v1NGQxug",
+      "handle": "@TED",
+      "name": "TED",
+      "description": "Talks on ideas worth spreading — clear speech, many with captions.",
+      "language": "en",
+      "tags": ["clear-speech", "captions-common"]
+    }
+  ]
+}

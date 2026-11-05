@@ -1,0 +1,653 @@
+# Feature: Transcript
+
+## MVP behavior
+
+- Primary transcript = `echo_sessions.transcript_id` for the latest session on `(targetType, targetId)` (same id as library media row).
+- **Track list stream** ([`TranscriptRepository.watchTracks`](../../lib/features/transcript/data/transcript_repository.dart)) exposes `List<TranscriptTrack>` per media id and is consumed through `allTranscriptsForMediaProvider`. Each `TranscriptTrack` defines **value equality** across its 7 fields (`id`, `targetType`, `targetId`, `language`, `source`, `label`, `trackIndex`), and the stream applies [`StreamDistinctExt.distinctBy`](../conventions.md#stream-dedupe-long-live-streams) with an element-wise list comparator so identical Drift re-emissions (e.g. an `echo_sessions` bump that doesn't change the resolved track list) never reach Riverpod listeners. Always-mounted consumers like `TransportCcButton` (the transport-bar CC indicator) only rebuild on real track changes — see `test/features/transcript/transcript_tracks_dedupe_test.dart` (9 pinning tests for skip-on-no-op and re-emit-on-real-change).
+- Import `.srt` / `.vtt` via `SubtitleParserFacade` storing JSON in `transcripts.timeline_json`. Imports use `source: user` and a user-chosen BCP-47 **language** (one row per `(target, source, language)` via deterministic id).
+- **Nested word/phone spans** ([ADR-0070](../decisions/0070-nested-transcript-timeline.md), [ADR-0073](../decisions/0073-craft-timeline-enrichment.md), [ADR-0074](../decisions/0074-karaoke-word-highlight.md), [ADR-0075](../decisions/0075-word-level-practice.md), [ADR-0076](../decisions/0076-stacked-ipa-player-controls.md), [ADR-0078](../decisions/0078-on-demand-transcript-enrichment.md)): a cue MAY include optional `timeline` (word spans) and each word MAY include `phones` (IPA + optional seconds), matching enjoy web `TranscriptLine` / `TranscriptWord`. Import, YouTube captions, and ASR still write line-only `{text, start, duration}` until the learner taps **Generate** in the CC sheet. **Craft save always attempts** on-device enrichment and persists nested JSON when alignment succeeds; failure keeps today’s synthesis line timings (or a blank transcript) without blocking save. **Highlight current word** (`transcript.karaokeHighlight`, default off) and **Show pronunciation (IPA)** (`transcript.ipaOverlay`, default off) are toggled from the **CC subtitle sheet** (display section), not Settings. Switches are **gated**: karaoke only when the primary track has timed words on **owned** media (a trusted local file **or** the learner’s cloud `mediaUrl`; not YouTube); IPA only when phone labels exist. Preference values are not wiped when a track cannot paint. When the primary track has lines but enrichment is incomplete (no nested words, or owned media missing timed words/phones), the same card shows an enrich tile (owned: timed words + IPA from this item’s audio, including cloud-library URLs via FFmpeg; YouTube: IPA labels only, no video download). When IPA is on and phones exist, each word is a stacked column (orthography + familiar-form IPA under Noto Sans in the echo orange accent); tap IPA to seek-and-play that word **only if** the word has a usable media window. Karaoke with IPA on uses a bottom border on the active word; overlay off keeps in-place highlight. Lookup text stays orthography. Line identity, echo membership, auto-translate, and blur stay line-level. IPA MUST NOT auto-reveal a blurred cue or leak through blur. There is no first-play / backfill alignment.
+- Tap line → seek + optional echo region update (via `PlayerInteractions`) **except** on the **active** cue and cues inside the **echo window**, where the row is **selectable** for dictionary lookup (no tap-to-seek on those rows). See [dictionary-lookup](dictionary-lookup.md).
+- **Track / import entry**: Use the player **CC** control (opens subtitle sheet). While cloud fetch runs and no tracks exist yet, the CC icon shows a **spinner**; when tracks exist, a **badge** appears. The transcript panel shows **Fetching subtitles…** during load, **friendly error + Retry** on failure, and the confirmed empty state only after resolution completes. Manual **Extract** / **Add subtitle** / **Refresh from cloud** actions show inline spinners (picker and empty state).
+- Subtitle track picker: **narrow** viewports use a draggable **Enjoy** bottom sheet; at **≥ `breakpointRail` (900px)** the same UI opens as a **centered dialog** (max width 560) for mouse-first layouts. The sheet body no longer nests an extra **SafeArea** (the modal already applies safe-area padding). **Loading** differs by presentation: the narrow sheet uses the shared scrollable `SkeletonTranscript`, while the wide dialog uses a bounded column of four `Skeleton.*` rows so it remains valid inside the dialog's `SingleChildScrollView`. **Error** / **empty** states: errors show **friendly** title + hint strings plus **Retry** (raw exception text is not surfaced in the primary message). Each track row is a **compact single-line tile**: leading radio, title, compact provider + language `MetaChip` pills on the same baseline, and a trailing delete `IconButton`; unselected rows are borderless with a 1px bottom divider, selected rows show a tinted card so many captions fit the picker viewport. Each track shows **provider** (`official` / `auto` / `ai` / `user`) and language. **Deleting** any transcript clears `echo_sessions` primary/secondary references when that track was selected, reassigns primary using **source priority** (`official` → `auto` → `ai` → `user`, then `createdAt`), and clears secondary if it would duplicate the new primary.
+- **Dictionary / translation lookup** ([ADR-0019](../decisions/0019-transcript-dictionary-lookup.md)): opened from transcript text selection. **Narrow**: `showEnjoySheet` + `DictionaryLookupSheet` (draggable). **Wide (≥ rail breakpoint)**: `showEnjoyDialog` with the same content in a bounded **dialog** (no double safe-area wrapper on the sheet body).
+- **Import subtitle language** dialog: the language field uses a visible **label** (`subtitlesImportLanguageFieldLabel`) in addition to the hint copy.
+- **Generate / re-generate transcript (ASR)**: local files with no transcript
+  expose **AI transcript** in the empty state; remote media (including YouTube)
+  show a tailored hint explaining that ASR is unavailable for remote sources, with
+  UI actions scoped to what is available for that source type. The subtitle picker
+  always exposes AI transcript or Re-generate depending on whether an `ai` track
+  exists. See `TranscriptEmptyState` (`transcript_empty_state.dart`) for the
+  local vs remote branching (`noTranscriptHint` / `noTranscriptHintRemote`).
+  Generated lines are stored as a first-class `source: ai` track and made
+  primary. Re-generation uses the same deterministic row id, preserving the
+  active echo-session reference while replacing the timeline in place. Remote
+  and YouTube sources are rejected before ASR starts. See [ASR generation](asr.md).
+- **Accessibility**: `TranscriptScrollableList` exposes a **list** semantics label. Each `TranscriptLineTile` exposes a **combined** semantics label (timestamp + snippet, with optional state prefix for current line / echo region). When `AppLocalizations` is absent (e.g. bare widget tests), semantics fall back to non-localized cue text only.
+- **Cloud transcripts**: In the **background when you open** a library item, the app runs **`resolveOnOpen`**: auto-select primary when tracks exist, import adjacent **sidecar** `.srt`/`.vtt` for local files, then call `/api/v1/transcripts` when signed in. Fetch lifecycle is observable in the UI (**CC spinner**, transcript panel **Fetching subtitles…**, picker banner). Outcomes persist in `transcript_fetch_states` (`lastStatus`, `lastError`). Cloud fetch runs once per target until **Refresh transcripts from cloud** in the picker. The same scheduling runs alongside opening the media engine (not gated on the play button). **Signed-out** users still get sidecar import and primary auto-select; cloud fetch is skipped.
+- **YouTube (Worker)**: For rows that resolve to YouTube playback (`provider` / URL / `vid` inference), the app currently speaks to the Enjoy Worker **cache-only** API (see [`specs/013-client-yt-transcripts/contracts/worker-cache-api.md`](../../specs/013-client-yt-transcripts/contracts/worker-cache-api.md)). Caption language follows **`videos.language`** (primary subtag sent to the worker). When language is missing or `und`, the worker fetch is **skipped** — the user must set content language first; correcting language clears fetch state so **Retry** can run with the new locale. Transcripts are stored locally with `targetId` = library media id. The worker origin defaults to `https://worker.enjoy.bot` (`kDefaultAiApiBaseUrl` in `lib/data/db/settings_keys.dart`); users can override it via the **AI API base URL** setting in Developer settings, or tap **Use API URL** to make the AI URL follow the main API URL (in-memory until the next override).
+  - **Lookup** (`YoutubeTranscriptsApi.getCachedTranscript`, `TranscriptRepository._fetchWorkerCachedTranscript`): the app calls `GET /youtube/transcripts?videoId&language` first; on 404 it falls back to a direct InnerTube caption fetch on the client (and uploads the result back to the worker — see **upload** below).
+  - **Upload** (`YoutubeTranscriptsApi.uploadTranscript`, `TranscriptRepository._uploadToWorkerAfterDirectFetch`): a client-side InnerTube fetch result is sent to `POST /youtube/transcripts` as `fire-and-forget`. The body carries `format: "enjoy"`, `videoId`, `language`, `captionFetch` (derived from `source`: `official` → `official`, anything else → `auto`), `source`, `timeline`, optional `metadata`, and `generatedAt` (ISO 8601 UTC). `ApiClient` converts camelCase keys to snake_case on the wire (`format`/`video_id`/`language`/`caption_fetch`/`source`/`timeline`/`generated_at`). `videoId` is `VideoRow.vid` when it matches the Worker's 11-character YouTube id pattern (`^[a-zA-Z0-9_-]{11}$`); otherwise the client falls back to `youtubePlaybackVideoId(...)` derived from provider / `mediaUrl` / source. `language` is the base subtag from `workerLanguageBase`. A failed upload (`false` or throw) is not lost: the full upload body is enqueued as a `kind: youtube_upload` `sync_queue` row (entity `video`, deduped per `videoId/language`) **through the shared job-shaped sync enqueue seam ([`syncEnqueueJobProvider`](../../lib/features/sync/application/sync_providers.dart)), which schedules an immediate queue drain when signed in — the retry does not wait for `SyncCtrl`'s 5-minute timer** (issue #749) — and is retried by the `SyncEngine` queue drain (issue #717), subject to the queue's [`SyncRetryPolicy`](../../lib/features/sync/domain/sync_retry_policy.dart) retry backoff (issue #752).
+  - **Validation** (worker, `apps/worker/src/routes/youtube/_validation.ts`): the worker rejects uploads missing `format`, `caption_fetch`, or `generated_at`, or with `caption_fetch` outside `auto`|`official`. The Dart client therefore **always** includes these three fields; transport/validation failures are swallowed and treated as a no-op (`uploadTranscript` returns `false`, callers ignore it).
+  - **Profiles** (`YoutubeTranscriptsApi.fetchClientProfiles`): the worker exposes the current YouTube InnerTube client profiles at `GET /youtube/client-profiles`, returning a `{"version", "profiles"}` envelope. Each profile on the wire is `{name, version, client_name_header, user_agent, context}` (`name` = InnerTube client name like `IOS`; `version` = client version). `ApiClient` snake→camel converts keys; `ClientProfile.fromJson` maps that shape (and the local camelCase cache shape) into `ClientProfile`, using `castJsonObjectOrNull` for nested `context`. The client then runs `resolveCaptionClientProfiles`: remote versions overwrite matching built-ins, missing preferred clients (`ANDROID_VR`, `MWEB`, …) are gap-filled from `kBuiltInClientProfiles`, and the list is reordered into the caption ladder (`IOS` → `ANDROID_VR` → `ANDROID` → `MWEB` → `WEB`). On envelope loss / transport error / empty usable list the call uses built-ins alone. Profiles are spoofed YouTube clients — they are **not** selected from the Flutter host OS.
+  - **Worker transit logging** (`YoutubeTranscriptsApi`, logger `YouTubeTranscripts`): every cache GET, upload, and profile fetch downgrades the API result on exception (so callers keep their fire-and-forget contract) but logs at **WARNING** with the offending video id / language / source / line count. A swallowed upload is otherwise invisible — operators need a production signal whenever a Windows fetch → Android cache miss silently regresses, so the failure is intentionally not silenced at the log layer. Look for entries like `worker upload failed for <videoId>/<language>` in `debugPrint`, logcat, and the rotating log file when triaging "captions work on Windows but never appear on Android" reports.
+  - **Historical note** ([ADR-0036](../decisions/0036-youtube-bilingual-transcripts.md), issue #320): the worker previously exposed a poll-based `POST /youtube/transcripts` that the client drove with `pollTranscript` / `pollTranscripts`. That endpoint was retired upstream; the corresponding client methods were removed (dead code, no production callers) and the legacy 008 contract doc is gone — the cache-only API above is the supported contract.
+  - **Label / metadata**: the stored transcript's `label` prefers `response.metadata.title` (trimmed, if non-empty); otherwise it falls back to the hardcoded (non-localized) string `"YouTube captions (<language>)"` where `<language>` is the same base subtag sent in the request.
+- **Embedded subtitles (video)**: No automatic demux. The picker and the transcript **empty state** offer **Extract** (video only); streams are saved as `source: user` (same uniqueness as imports). If `media_kit` has not listed subtitle tracks yet, the app falls back to **`ffmpeg -i`** stderr to find `Subtitle:` streams and demuxes with `-map 0:s:N` (same as before when tracks were known). **Windows / Linux**: Demux uses a CLI `ffmpeg` — next to the app (`ffmpeg.exe` on Windows installed from `windows/ffmpeg/ffmpeg.exe` when present at build time; `ffmpeg` next to the Linux executable or under its `lib/` for AppImage/desktop bundles) or **`ffmpeg` on PATH**. If neither is available, extraction no-ops; users can still import `.srt` / `.vtt`. FFmpegKit is Android / iOS / macOS only — the vendored plugin ships no Windows/Linux implementation, so those platforms must never route through it. Details: [`windows/ffmpeg/README.md`](../../windows/ffmpeg/README.md).
+- **On-video subtitles**: Disabled by default (`SubtitleTrack.no()` after open + `SubtitleViewConfiguration.visible: false` on [`Video`](../../lib/features/player/presentation/layouts/video_player_layout.dart)); cues are shown in the transcript panel instead.
+- **Markup**: SSA/HTML-like cues (`<font color="…">`, `<b>`, `<i>`, `<br>`, etc.) are parsed in the transcript panel via `parseSubtitleMarkup` (`lib/data/subtitle/subtitle_markup_parser.dart`); colors and styles render as rich text instead of raw tags. A cue with no `<` and no `&` carries neither markup nor entities, so it comes back as one unstyled segment without touching the 256-entry parse cache — plain cues therefore no longer evict marked-up cues from it. The transcript tile derives the plain cue text once per build and reuses it for the karaoke range, the semantics snippet, and the blurred shape words.
+- **Line UI**: Each cue has a compact **meta row** (timestamp first; **recording count** badge with mic icon when shadow-reading takes overlap that cue by time range), then body text after a **2px** gap. Horizontal line padding is **16** from `EnjoyThemeTokens.transcriptLinePadding` (do **not** pass `EdgeInsets.horizontal` into `EdgeInsets.symmetric` — that getter sums left+right). Vertical padding comes from [`transcriptDensityOf`](../../lib/core/transcript/transcript_density.dart) `lineVerticalPadding`. Row backgrounds are **transparent** by default; **hover**, **active playback**, **echo-range**, and **active inside echo** use distinct tints (playback within the echo region blends echo orange with primary vs plain active vs echo-only lines).
+- **Active-line rail**: the **active** playback line carries a **3px left rail** (rounded ends) colored **primary** for a plain active cue and **echo orange** for a cue inside the echo region — also when both apply. Cues outside the active/echo set have no rail.
+- **Secondary (translation) track hierarchy**: when a translation track is rendered alongside the primary line, it sits below the primary with a **2px left border** tinted `onSurfaceVariant @ 22%` to keep reads ordered without italic. Rendered through `Noto Sans SC` with the same CJK fallback chain as the primary track — see [app-ui § Typography](app-ui.md#typography).
+- **Auto translate** ([ADR-0038](../decisions/0038-viewport-per-line-auto-translate.md), persistence from [ADR-0037](../decisions/0037-transcript-auto-translate.md), identity from [ADR-0039](../decisions/0039-auto-translate-primary-text-keyed-overlay.md)): the translation picker offers **Auto translate** after **None** (AI `source: ai` tracks are hidden from the generic list to avoid duplicate rows). Selecting it ensures a durable AI secondary track keyed by native language; the transcript list then calls `requestTranslateLine` for each built row with empty AI text (viewport / cache-extent driven, ≤2 concurrent). Finished lines are **cached in Drift** — scrolling away and back shows cached text without re-requesting. Display uses the **primary line index** (not time matching); each cue stores a `sourceKey` fingerprint of normalized primary text + language pair so edited primary text soft-invalidates that line. Identical primary lines can reuse a cached translation. Each translated line has an inline **refresh** control to re-translate that line only. In-flight lines show a compact “Translating…” placeholder. Coexists with YouTube bilingual secondary tracks and imported captions (those still use time-based matching). A credits exhaustion mid-run blocks the run (spec 045): the picker shows the shared friendly credits message — required vs. remaining credits when the worker envelope was parsed — with a **View plans & packages** action → `/subscription`; already-translated lines are kept and the run resumes after purchase.
+  **Scheduling is one module** ([`auto_translate_line_request_policy.dart`](../../lib/features/transcript/application/auto_translate_line_request_policy.dart), issue #764): `shouldRequestAutoTranslateLine` decides whether a visible cue qualifies — auto-translate on, no secondary text, not failed, and within `kAutoTranslateViewportWindow` of the playback highlight *or* the estimated scroll focus — while `scheduleAutoTranslateLineRequest` fires it one frame later, **re-checking first** so a cue that scrolled out of the window during the frame is never requested. The scrollable list and the echo card both go through it, distinguished by an explicit `AutoTranslateRequestScope` (`viewport` vs `block`, where the rendered echo block is its own viewport). They used to carry separate copies: the list re-checked staleness and the echo card did not, so a request could outlive the viewport that justified it.
+- **Recording counts** read from local Drift (`recordings` table); when signed in, cloud metadata sync runs on media open ([`schedulePlayerOpenSideEffects`](../../lib/features/player/application/player_open_side_effects.dart)) and counts update live when new takes are saved in echo mode.
+- **Auto-follow**: While the engine is **playing**, the list auto-scrolls when the target would be off-screen (`Scrollable.ensureVisible`). **Non-echo**: the **active cue** is brought into view with a mid-viewport bias (`alignment ~0.42`). **Echo mode**: the merged **echo block** (controls + cue card + shadow-reading stack) is the scroll target and is aligned to the **top** of the transcript viewport to leave more vertical room for the shadow panel. When paused, the list does not auto-scroll.
+- **Echo region** (echo mode on): **Expand / shrink** controls sit **between** the transcript list and the shadow panel as separate rows (not inside the cue card). **Cue lines** use one merged rounded **transcript card**; **shadow reading** is a **compact stack** below with an **idle toolbar** (optional **share** slot on the left, pitch **icon** toggle, **centered** 44pt record FAB inside a 56pt hit/ring target, play + **more** menu **grouped at center**; **delete** is in the menu as a **list-style row** (leading delete icon, same column as take checkmarks), with a **confirm dialog** before removal), **pitch chart** when expanded (headerless body only), and **recording focus** (centered FAB + elapsed vs segment target; over-target warning only). Long hint is in the record control **tooltip** (shortcut + `shadowReadingHint`) — see [`ShadowReadingPanel`](../../lib/features/shadow_reading/presentation/shadow_reading_panel.dart). Take duration is derived from the **WAV header** (see [`wav_duration_ms`](../../lib/core/audio/wav_duration_ms.dart)). Take playback uses a dedicated **`media_kit`** preview player ([`recording_preview_player`](../../lib/core/audio/recording_preview_player.dart)), separate from lesson playback so the loaded lesson is not replaced. The share slot hosts [`SharePracticePosterButton`](../../lib/features/share_poster/presentation/share_practice_poster_button.dart); it is visible only when echo mode is active **and** recordings exist for the active target — see [ADR-0068](../decisions/0068-shadow-toolbar-share-button.md). The wavy mispronunciation underlines for a scored take come from `takeAssessmentNotesProvider`: notes are memoized per `(mediaId, recordingId, assessmentJson)` and the payload decodes once (off the isolate above 32 KB), so an Echo-card rebuild reuses the memo instead of re-parsing the assessment.
+
+## Mobile density
+
+Transcript list and echo-region chrome use [`transcriptDensityOf(context)`](../../lib/core/transcript/transcript_density.dart) to switch between full and compact values. Compact is selected when `isMobilePlatform` ([`lib/core/platform/mobile_platform.dart`](../../lib/core/platform/mobile_platform.dart)) is true (iOS / Android). Values are summarized below:
+
+| Property | Desktop | Mobile |
+|----------|--------:|-------:|
+| ListView horizontal padding | 12 | 8 |
+| ListView vertical padding | 8 | 4 |
+| Transcript line vertical padding | 6 | 4 |
+| Inter-line gap | 4 | 2 |
+| Header-to-body gap | 2 | 2 |
+| Primary-to-secondary gap | 4 | 2 |
+| Secondary text left padding | 12 | 8 |
+| Body line height | 1.45 | 1.35 |
+| Secondary line height | 1.4 | 1.3 |
+| Echo controls vertical padding | 4 | 2 |
+| Echo card gap | 8 | 4 |
+| Echo bottom-panel gap | 8 | 4 |
+| Echo divider thickness | 1.0 | 0.5 |
+| Echo control icon size | 20 | 16 |
+
+Per-line padding, gutter widths, and lens type sizes come from [`TranscriptLensMetrics`](../../lib/core/transcript/transcript_lens_metrics.dart) (canvas v30: line 19 / current 25 on desktop, 16/20 in the video column, 17/23 on phones; the current line sits on a paper card with a lift shadow) (the `Main` / `Phone` boards), not from this density table. The density is resolved from each affected widget's `BuildContext` so the choice follows the live `defaultTargetPlatform` (no static-initialized token).
+
+## Code layout
+
+The subtitle track picker is split into focused modules under
+[`lib/features/transcript/presentation/`](../../lib/features/transcript/presentation/),
+organized by dependency layer (helpers → primitives → tiles → sections →
+actions → action handlers → body → popover route → sheet). The public API is
+unchanged; `showSubtitleTrackPicker`, `SubtitleTrackPickerSheet`, and
+`SubtitleTrackPickerPresentation` continue to
+be exported from [`subtitle_track_picker_sheet.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_sheet.dart).
+
+| File | Responsibility |
+|------|----------------|
+| [`subtitle_track_picker_helpers.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_helpers.dart) | Pure helpers (`sheetHorizontalPadding`, `trackOptionPadding`, `trackPickerRadioTheme`, `trackLabel`, `findTrack`, `providerLabel`, `providerBadgeColors` — one neutral badge for every source), the `kExpandedTrackListMaxHeight` const, and the `PickerSection` enum. No widgets. |
+| [`subtitle_track_picker_primitives.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_primitives.dart) | `SubtitlePanelOverline`, `SubtitlePanelDivider`, `SubtitleToggleTile` (title over hint, switch at the end), and `MetaChip`. |
+| [`subtitle_track_picker_tiles.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_tiles.dart) | `TrackOptionTile<T>` (per-track radio row with provider + language chips and delete action) and `NoneOptionTile` (the explicit "none" row in the translation list). |
+| [`subtitle_track_picker_sections.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_sections.dart) | `CollapsibleTrackSection` (a flat track row — label over the selected track, chevron — that opens its list in place) and `SelectionSummary`. |
+| [`subtitle_track_picker_actions.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_actions.dart) | `TranscriptActionsList` — the phone sheet's Transcript actions (busy-guarded `TranscriptBusyListTile` rows). |
+| [`transcript_actions.dart`](../../lib/features/transcript/presentation/transcript_actions.dart) | `TranscriptAction` + `watchTranscriptActions` — the one list of transcript actions shared by the player's ⋯ More menu and the phone sheet (which actions apply to local / YouTube / audio / video, and their labels). |
+| [`subtitle_track_picker_sheet_action_handlers.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_sheet_action_handlers.dart) | Free functions owned by the action list: `refreshCloudTranscripts`, `confirmAndDeleteTranscriptTrack`. Import / extract / generate live in their own modules so the transcript empty state shares one entrypoint per action. |
+| [`import_subtitle_file.dart`](../../lib/features/transcript/presentation/import_subtitle_file.dart) | `pickAndImportSubtitleFile` — the **single** local-file import flow (file pick → language dialog → repository import → success notice), plus `kSubtitleImportExtensions` and the `SubtitleFilePick` seam. Shared by the picker sheet and the transcript empty state; always emits the `transcriptGeneration*` funnel with `source: local_file`. |
+| [`download_transcript.dart`](../../lib/features/transcript/presentation/download_transcript.dart) | `downloadActiveTranscript` — the **single** transcript download flow (read active primary lines → format dialog → serialize → save/share → notice), with `TranscriptLinesLoad` / `TranscriptFormatPick` / `TranscriptExportSave` seams. Shared by the ⋯ More menu and the phone sheet. |
+| [`download_transcript_format_dialog.dart`](../../lib/features/transcript/presentation/download_transcript_format_dialog.dart) | `showTranscriptExportFormatDialog` — the SRT / VTT choice (`EnjoyPressable` rows over `showEnjoyAlertDialog`, ADR-0018 / ADR-0093); tapping a row resolves the format, dismissing resolves null. |
+| [`subtitle_track_picker_sheet_body.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_sheet_body.dart) | Top-level builders: `buildSheetHeader`, `buildTracksContent` (async data / loading / error wiring), `buildTrackListBody` (primary + translation radio groups, blocked-message callouts, translation track list), `buildDialogSkeletonLoading`. |
+| [`subtitle_track_picker_popover_route.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_popover_route.dart) | `subtitlesPopoverRoute` — the content-sized 384px raised-card popover anchored 10px under the top bar (ADR-0093 / ADR-0066), built on the shared `AnchoredPopoverRoute` (ADR-0018). |
+| [`transcript_display_settings_sheet.dart`](../../lib/features/transcript/presentation/transcript_display_settings_sheet.dart) | `TranscriptDisplaySettingsSection` — the Display section: `TranscriptTypefacePicker` (Book / Clean), gated highlight + IPA switches, and `TranscriptEnrichmentCard` (progress with Cancel, or failure with retry). |
+| [`transcript_typeface_scope.dart`](../../lib/features/transcript/presentation/transcript_typeface_scope.dart) | `TranscriptTypefaceScope` — swaps `TranscriptTypographyTokens` for `.clean()` when the typeface preference is Clean. |
+| [`subtitle_track_picker_sheet.dart`](../../lib/features/transcript/presentation/subtitle_track_picker_sheet.dart) | Slimmed sheet: `SubtitleTrackPickerPresentation` enum, `showSubtitleTrackPicker` launcher, and `SubtitleTrackPickerSheet` + its state class. Owns the `PickerSection` expand/collapse state, secondary-selection routing, provider watches, and the sheet vs. dialog layout decision. |
+
+Smoke coverage lives in
+[`subtitle_track_picker_sheet_test.dart`](../../test/features/transcript/subtitle_track_picker_sheet_test.dart)
+(pumps the sheet in dialog presentation with faked providers and asserts the
+empty-tracks hint plus primary + translation section headers for a single
+track). The shared import flow is covered end to end by
+[`import_subtitle_file_test.dart`](../../test/features/transcript/presentation/import_subtitle_file_test.dart)
+(picker cancel, dialog cancel, blank and trimmed languages, success notice,
+the `transcriptGeneration*` funnel, and a repository-wiring case asserting the
+persisted track). The split is also recorded as
+[`2026-07-07-subtitle-track-picker-split-design.md`](../superpowers/specs/2026-07-07-subtitle-track-picker-split-design.md).
+
+The scrollable transcript list is split the same way (issue #1005). The public
+API is unchanged: `TranscriptScrollableList` stays in
+[`transcript_scrollable_list.dart`](../../lib/features/transcript/presentation/transcript_scrollable_list.dart),
+now a composition root (provider watches, `ref.listen` wirings, and the
+`ListView.builder` scaffold with the blur-practice cache-extent constants).
+
+| File | Responsibility |
+|------|----------------|
+| [`transcript_virtual_items.dart`](../../lib/features/transcript/application/transcript_virtual_items.dart) | UI-free render-item model: `buildTranscriptVirtualItems` collapses the echoed line range into one `TranscriptVirtualEcho` card slot, every other line stays a `TranscriptVirtualLine`. |
+| [`transcript_auto_scroll_controller.dart`](../../lib/features/transcript/presentation/transcript_auto_scroll_controller.dart) | `TranscriptAutoScrollController` — the auto-follow engine: `ScrollController`, scroll-generation guard, rotating scroll-target `GlobalKey`s, manual-scroll suppression, and the jump-estimate → `ensureVisible` sequence. Owns `kTranscriptScrollAlignment` (0.42) and `kTranscriptScrollEstimateFactor`. |
+| [`transcript_line_item_builder.dart`](../../lib/features/transcript/presentation/transcript_line_item_builder.dart) | `buildTranscriptListItem` + `TranscriptListItemScope`: one virtual item → one row (echo card, auto-translate resolve + request scheduling, echo-loop edge rows, `TranscriptLineTile`). `requestableAutoTranslate` stays a top-level function, not a per-row closure (issue #764). |
+
+### Download transcript (SRT / VTT export)
+
+**⋯ More → Download transcript…** (canvas v30, issue #921) saves the active
+primary transcript as a subtitle file. The entry appears in both the desktop
+More menu and the phone Subtitles & display sheet through the shared
+`watchTranscriptActions` list, and only when a transcript row exists for the
+media (the cheap boolean `transcriptHasLinesForMediaProvider`, so line-level
+rewrites never reshuffle the menu; an empty primary still surfaces the
+empty notice on tap). The flow
+([`download_transcript.dart`](../../lib/features/transcript/presentation/download_transcript.dart))
+reads the primary lines and the media title, asks for the format
+([`showTranscriptExportFormatDialog`](../../lib/features/transcript/presentation/download_transcript_format_dialog.dart)),
+serializes, and hands the bytes to the platform save dialog (desktop,
+`FilePicker.saveFile`) or share sheet (iOS / Android, `share_plus`) — the same
+IO shape as the diagnostics, Anki, and practice-poster exports, all through the
+shared
+[`saveOrShareBytes`](../../lib/core/platform/file_share_export.dart)
+helper.
+The file is named after the media title
+(`transcriptExportBaseName` in
+[`subtitle_filename.dart`](../../lib/data/subtitle/subtitle_filename.dart):
+filesystem-invalid characters become spaces, whitespace collapses, empty falls
+back to `transcript`).
+
+The serializers
+([`subtitle_serializer.dart`](../../lib/data/subtitle/subtitle_serializer.dart))
+are the write-side inverse of the subtitle parsers
+([`subtitle_parser.dart`](../../lib/data/subtitle/subtitle_parser.dart)):
+SRT writes 1-based indexed cues with `HH:MM:SS,mmm` timestamps, VTT writes a
+`WEBVTT` header with `HH:MM:SS.mmm`. Cues with blank text or non-positive
+duration are skipped, and cue text is trimmed with blank interior lines
+dropped — the outputs round-trip through `SrtParser` / `VttParser` exactly for
+that input. VTT cue text carrying inline `<…>` markup is written verbatim and
+the VTT parser strips tags on read, so such cues are the one non-bit-exact
+case. Pinned by
+[`subtitle_serializer_test.dart`](../../test/data/subtitle/subtitle_serializer_test.dart)
+(round trips), `download_transcript_format_dialog_test.dart`,
+`download_transcript_test.dart`, and the `transcript_actions_test.dart`
+entry-gating cases.
+
+### Transcript repository shape
+
+[`TranscriptRepository`](../../lib/features/transcript/data/transcript_repository.dart)
+owns the transcript surface for a media target. Every public member is a
+class method (virtual, overridable by test fakes); the YouTube internals are
+the only part-file extensions, both private:
+
+| Part file | Responsibility |
+|-----------|----------------|
+| [`transcript_repository_youtube_fetch.dart`](../../lib/features/transcript/data/transcript_repository_youtube_fetch.dart) | YouTube transcript fetch orchestration: worker cache lookup, InnerTube direct fallback, worker upload, post-fetch primary picker |
+| [`transcript_repository_youtube_worker_cache.dart`](../../lib/features/transcript/data/transcript_repository_youtube_worker_cache.dart) | Worker cache-only API interaction (`GET /youtube/transcripts`, `POST /youtube/transcripts`) |
+
+Interface notes:
+
+- `resolveOnOpen` is the single public entry for the open path. Its steps —
+  primary auto-select and sidecar import — are private
+  (`_ensurePrimaryTranscript`, `_importSidecarSubtitles`); callers never
+  orchestrate them.
+- Subtitle import (`importSubtitle`, `extractEmbeddedTracks`) and
+  auto-translate track management (`ensureAutoTranslateTrack`,
+  `updateAutoTranslateLineText`, `isAutoTranslateTrackStale`) are class
+  methods alongside the rest of the surface.
+- `updateAutoTranslateLineText` **buffers** the line and flushes the row at
+  most once per `kAutoTranslateFlushInterval` (1 s) window from the first
+  buffered line (issue #810 D1) — one row rewrite per burst instead of one
+  per line. Reads via `linesForRow` overlay the buffer, so controller and
+  UI see the logical state immediately. The autoDispose
+  `AutoTranslateCtrl` flushes on its own disposal (player screen unmount);
+  a hard kill inside the window loses at most 1 s of translated text. A
+  stale skeleton rebuild and `deleteTranscript` drop the buffer for that
+  track.
+- Reactive lines are repo-owned: `watchPrimaryLines(mediaId)` /
+  `watchSecondaryLines(mediaId)` hide target-type resolution, the
+  active-row-only fetch, the 16 KB isolate-preload threshold, and the
+  merge/distinct of echo-session + transcript watches. The Riverpod
+  providers in `transcript_lines_provider.dart` are thin wrappers and
+  `autoDispose` families (issue #810 C2): decoded lines and their Drift
+  watch streams are released once no widget watches the media, while the
+  repository — and its `TranscriptTimelineCache` decode memo — survives for
+  warm re-entry. That memo is an `L1Store` LRU bounded to 8 rows (issue
+  #810 C1): a `(updatedAt, timelineJson character count)` revision mismatch on
+  the same row id and explicit removal on row mutation are the only
+  invalidations, and the least-recently-used decode is dropped on overflow.
+  `allTranscriptsForMediaProvider` (the per-media track list behind the
+  transport CC button and the subtitle picker) joined them as an
+  `autoDispose` family in issue #818, so it no longer pins one tracks watch
+  per media visited this session.
+  The revision is sound because drift stores `updated_at` at whole-second
+  granularity and `TranscriptDao.upsert`/`upsertAll` nudge a same-second
+  consecutive write one second forward, so the pair changes on every
+  content change (issue #810 D5; replaces the previous SHA-1-over-JSON
+  identity, which hashed the full 1–10 MB timeline on every watch tick).
+  The length half is a Unicode scalar count (`timelineJsonCharacterCount`),
+  not `String.length`, so that it matches SQLite `length()`: the revision
+  projections (`TranscriptDao.watchRevisionById` / `metaById`) compute it in
+  SQL, and a UTF-16 code-unit count would miss the memo for every non-BMP
+  timeline (emoji, astral CJK). The Dart-side count is a linear code-unit
+  scan (a surrogate pair counts as one character, as SQLite's `length()`
+  does) rather than a rune-by-rune walk, and the repository derives it once
+  per row per revision tick, threading the revision through the preload and
+  decode paths instead of re-deriving it at each step.
+- Transcript watches are light: `TranscriptDao.watchSummariesForTarget`
+  projects only track metadata + change-tick columns (`selectOnly`, no
+  `timeline_json`), and the lines/tracks watchers refetch payloads
+  themselves through the memoized codec path (issue #810 D2), so a write
+  no longer re-copies every timeline blob of that media to the UI isolate.
+- Timeline **encodes** are size-gated like decodes: every write site routes
+  through `encodeTimelineJsonGated` (16 KB estimate threshold), which keeps
+  small timelines inline and encodes large ones in a background isolate
+  (issue #810 D4).
+
+## Dictate lens (listening-focus) mode
+
+The **Dictate** lens (`H`, or the third segment of the top bar's
+Listen · Echo · Dictate switch; canvas v30, ADR-0093 amendment R4) replaces every transcript cue body text with rounded **shape bars** sized from the hidden words' text boxes, instead of a Gaussian blur (ADR-0093 decision 6 — cheaper to paint, same reveal rules). The user can practice listening first and then peek at the text to check themselves. Like echo, the Dictate lens is a
+**per-media player practice mode** (not a Settings preference). The
+mode is deliberately hearing-focused:
+
+- The **active playback cue is never auto-revealed**. Even when
+  playback runs through the transcript, every cue — including the
+  currently playing one — stays blurred. See
+  [`specs/006-transcript-blur-practice/spec.md`](../../specs/006-transcript-blur-practice/spec.md)
+  § Clarifications (Session 2026-07-08) for the user-facing rationale
+  and the rule.
+- The only ways to see a cue's text while the Dictate lens is on are
+  pointer hover (macOS, Windows) or a tap that starts a hold
+  (every platform).
+- While the Dictate lens is on, the transcript list's off-screen pre-build
+  window shrinks from 1400 px to 200 px (issue #810 G —
+  `kTranscriptScrollCacheExtentPx` / `kTranscriptBlurPracticeCacheExtentPx`
+  in `transcript_scrollable_list.dart`): a hidden cue still has to be
+  measured and painted as shape bars, and pre-building a screenful of
+  unreadable cues buys nothing. The reveal behavior is unchanged — revealed
+  cues still drop their shapes individually.
+
+### Toggle, hover, and tap-reveal
+
+- The **toggle** is the **Dictate** segment of the top bar's
+  Listen · Echo · Dictate switch (see the
+  [player dock](player.md) and
+  [Duet presentation](#presentation--the-listen-lens-duet-adr-0093)),
+  and the `H` hotkey (`player.toggleBlurPractice`) fires the same action
+  via `PlayerInteractions.toggleBlur()`. There is **no** Hide-text switch in
+  the CC display card and **no** blur button on the player dock — the
+  Dictate lens owns the mode (ADR-0093 decision 6).
+- On macOS and Windows, **hovering a cue unblurs it**; pointer-out
+  re-blurs it within one frame. The hover state is owned by the tile
+  widget itself so per-frame hover changes do not invalidate unrelated
+  cues. This now applies to active and echo cues too — selectable tiles
+  carry the same `MouseRegion` as plain cues.
+- On every platform (including desktop as a fallback), **tapping a
+  blurred cue starts a fixed 3-second hold** (`kTapRevealHoldSeconds`)
+  that reveals it. For plain cues the tap also seeks playback to that
+  cue; for selectable (active / echo) cues the tap reveals without
+  seeking. During the hold the cue is unblurred; when the hold expires
+  it re-blurs. Tapping a different cue replaces the hold (the prior cue
+  re-blurs immediately, the new cue reveals). Hold duration is **not**
+  user-configurable.
+
+### Persistence
+
+Blur on/off is stored per target on `echo_sessions.blur_active`
+(device-local, same row as echo practice fields — **not** synced to the
+server profile):
+
+- In-memory state: `transcriptBlurModeProvider`
+  ([`transcript_blur_mode_provider.dart`](../../lib/features/transcript/application/transcript_blur_mode_provider.dart)).
+- Written by [`PlaybackSessionPersister`](../../lib/features/player/application/playback_session_persister.dart)
+  (debounced position ticks + immediate `writeNow` on toggle).
+- Restored in [`player_open_coordinator.dart`](../../lib/features/player/application/player_open_coordinator.dart)
+  when opening media; cleared with `deactivate()` in
+  [`PlayerController.clear`](../../lib/features/player/application/player_controller.dart).
+
+### The display panel
+
+Wide windows open the picker as the Duet **Subtitles & display
+popover**: a 384px raised card anchored under the top bar's Subtitles
+chip (a PopupRoute, so the player surface parks per ADR-0066), sized to
+its content. Narrower windows keep the bottom sheet. Since canvas v30
+the panel holds only what you see and read:
+
+- **Subtitles** — Primary and Translation rows; each opens its track list
+  in place.
+- **Display** — **Transcript type** (Book = Literata, the default; Clean =
+  Geist; device flag `transcript.cleanTypeface`, applied by
+  `TranscriptTypefaceScope` around the transcript list), **Highlight the
+  spoken word** and **IPA under words** (gated as above; a disabled switch
+  says what to add first), and a progress card while word timings
+  generate (with Cancel) or after they fail (with retry).
+- The transcript **actions** — add a subtitle file, use embedded subtitles,
+  create / re-run the AI transcript, add word timings & IPA, refresh from
+  cloud — live in the player's **⋯ More** menu on desktop; the wide panel
+  ends with a hint pointing there. The phone has no More button, so the
+  sheet lists the same actions at its foot. Both read one list,
+  `watchTranscriptActions` (`transcript_actions.dart`).
+- Hide text is no longer a switch here; it is the Dictate lens.
+
+### Hidden-text rendering
+
+Duet renders hidden lines as **rounded shape bars** sized from the
+hidden words' text boxes (measured once per line layout and cached) —
+no `ImageFilter.blur` anywhere in the player. The reveal rules are
+unchanged (hover / press-and-hold, active cue), and tapping the shapes
+on a selectable cue starts the same hold-to-peek.
+
+The hidden text is painted via `TranscriptBlurText`
+([`lib/features/transcript/presentation/transcript_blur_text.dart`](../../lib/features/transcript/presentation/transcript_blur_text.dart))
+inside `TranscriptLineTile`. Only the body text widgets are wrapped —
+timestamps, recording badges, hover tints, the active-line rail, and
+the merged echo card chrome (rails / dividers / controls) are never
+blurred; the cue text inside the echo card is. When the toggle is off
+the cue renders exactly as before (zero overhead).
+
+### Active-line and active-cue rule (the 2026-07-08 clarification)
+
+The original draft proposed an "always reveal the active line" rule
+as the bridge between desktop hover and mobile interactions. The user
+corrected this: the purpose of the mode is hearing-focused practice,
+so revealing the active line defeats the goal. The active cue has no
+privileged state — `transcriptCueRevealProvider`
+([`lib/features/transcript/application/transcript_cue_reveal_provider.dart`](../../lib/features/transcript/application/transcript_cue_reveal_provider.dart))
+explicitly does NOT read
+`transcriptPlaybackHighlightProvider`, and the widget-level OR
+(`!blurEnabled || _hover || providerRevealed`) treats the active cue
+exactly like every other cue.
+
+### Echo mode
+
+The Dictate lens continues to apply to cues rendered inside the
+echo region, including the active echo cue. Hover and tap-reveal work
+the same way as plain cues: the echo tiles carry a `MouseRegion`
+(hover reveal) and tapping the cue text starts the reveal hold. Only
+the cue body text is hidden — the echo card chrome and the
+shadow-reading panel are not.
+
+### Tests
+
+Coverage lives under
+[`test/features/transcript/`](../../test/features/transcript/) and
+[`test/features/player/`](../../test/features/player/):
+
+- `transcript_blur_mode_provider_test.dart` — activate / deactivate /
+  toggle / restoreFromSession.
+- `transcript_blur_session_persist_test.dart` — `blur_active` written
+  via `PlaybackSessionPersister.writeNow` and restored.
+- `player_top_bar_test.dart` — the desktop mode switch has
+  **Listen · Echo · Dictate** segments, and tapping **Dictate**
+  (`player-lens-dictate`) selects the Dictate lens.
+- `player_interactions_class_test.dart` — `toggleBlur()` activates and
+  deactivates `transcriptBlurModeProvider`, and does not activate when
+  there are no transcript lines.
+- `transcript_display_gating_test.dart` — the CC display card has
+  **no** Hide-text switch (the Dictate lens owns it).
+- `transcript_blur_hover_test.dart` — pointer-enter reveals;
+  pointer-out re-blurs; toggle-off bypass.
+- `transcript_blur_selectable_reveal_test.dart` — the active / echo
+  (selectable) cue reveals on hover and tap-reveal, matching plain cues.
+- `transcript_blur_hold_test.dart` — tap seeks + reveals; expiry
+  re-blurs; second tap replaces the hold; toggle-off bypass.
+- `transcript_blur_active_line_stays_blurred_test.dart` — drives the
+  active cue through several indices while blur is on and asserts the
+  active cue never auto-reveals (the spec's hard rule). Karaoke on does
+  not change that contract. IPA overlay on also must not auto-reveal or
+  leak stored phone labels through an unrevealed cue.
+- `transcript_blur_long_list_perf_test.dart` — 10 000-line smoke:
+  shape-bar tiles render unrevealed and scrolling throws no exception.
+
+## Presentation — the Listen lens (Duet, ADR-0093)
+
+Each cue is a flat row on the ground. On desktop a 44px gutter (36px in
+the video column) holds a mono 11px timestamp (right-aligned) and, when
+the line has takes, a you practiced dot; on phones the gutter is an 8px
+practiced-dot column and the active cue's time sits above its text in
+original-ink. The text column carries the Literata line (17 desktop /
+15 video / 16 phone; the active cue 21 / 17 / 20 at weight 500) with the
+Geist secondary translation (13.5, active 14.5; 12.5 / 13.5 in the video
+column and on phones) under it — no plate, no rail, no accent wash.
+Every size lives in
+[`TranscriptLensMetrics`](../../lib/core/transcript/transcript_lens_metrics.dart),
+resolved per surface (desktop, video column via
+`TranscriptVideoColumnScope`, phone). Inactive cues read ink3 and brighten to ink on hover. The karaoke
+word paints as an **original-blue underline** on the spoken word (plain
+markup path and aligned-words path alike). The recording-count badge is
+replaced by the gutter dot; the count stays in the accessibility label.
+
+The gutter timestamp shares the first text line's alphabetic baseline
+(the row aligns on baseline whenever the time is in the gutter), and the
+active cue's time takes original-ink. The practiced dot hangs below the
+timestamp out of layout flow, so a line with takes is exactly as tall as
+one without. With the IPA overlay on, each word is a column whose IPA
+label starts at the word's left edge (1px inset, never centred), words
+sit 0.26em apart, and wrapped rows are 8px apart (10px in the Echo loop),
+matching the `Main` board. Emphasized words keep the line's weight 500
+rather than a separate bold. Echo lens rows (the faded context around the
+loop) never show the IPA overlay.
+
+## Karaoke highlight
+
+The "what is highlighted right now" question has a single owner:
+[`transcriptPlaybackHighlightProvider`](../../lib/features/transcript/application/transcript_playback_highlight_provider.dart)
+returns a record of `({int cueIndex, int? wordIndex})` per media id:
+
+- `cueIndex` — the echo-aware active cue (`-1` when there are no lines),
+  quantized on the 400 ms display position bucket.
+- `wordIndex` — the karaoke current-word index on that cue, or `null`
+  when karaoke is off / still loading, `karaokeSwitchEnabled` is false
+  (no timed words on owned media), the cue is out of range, or the
+  position is in a word gap. This is gated by the
+  `transcript.karaokeHighlight` setting **and** display readiness
+  ([ADR-0074](../decisions/0074-karaoke-word-highlight.md),
+  [ADR-0078](../decisions/0078-on-demand-transcript-enrichment.md)).
+
+The 50 ms karaoke position stream is watched **only after** the karaoke
+gate passes, so karaoke-off transcripts never subscribe to the word tick
+stream. Consumers that only need the cue index must use
+`.select((h) => h.cueIndex)` on the watch / `ref.listen` (and plain
+`.cueIndex` on reads) so they are not rebuilt on the 50 ms word ticks;
+only the active transcript tile watches the full record (for the
+in-place word paint). The separate `karaokeWordIndexProvider` /
+`activeCueWordIndexProvider` providers were folded into this one (the
+latter was an orphan with no call sites). Provider tests live in
+[`transcript_playback_highlight_provider_test.dart`](../../test/features/transcript/application/transcript_playback_highlight_provider_test.dart).
+
+## Familiar-form IPA derivation
+
+[`wordIpaSpelling`](../../lib/data/subtitle/transcript_word_ipa.dart) turns a
+word's stored phone labels into the familiar teaching form the IPA overlay
+paints. The result depends only on `TranscriptWord.phones`, so it is memoized
+per word instance in an `Expando` — weak keys, so an entry dies with the word
+and no eviction policy is needed. The transcript list asks for the same words
+again on every cue change, and `transcriptDisplayReadiness` asks per line, so
+the memo takes the repeated derivation out of both paths. The readiness scan
+also stops once `hasPhones` and `hasTimedWords` are both known: the flags are
+monotone, so the remaining lines cannot change them.
+
+The invariant the memo relies on: a `TranscriptWord`'s `phones` list is never
+mutated after construction (`TranscriptWord` is `@immutable`, and every
+producer builds a fresh list).
+
+## Auto-translate source key
+
+[`autoTranslateSourceKey`](../../lib/features/transcript/domain/auto_translate.dart)
+hashes the normalized primary cue text together with the language pair into
+the `sourceKey` fingerprint every AI cue stores, so an edited primary text
+soft-invalidates that line. The transcript list re-derives that key for every
+visible row on every rebuild — the row builder and the echo card both resolve
+the secondary text — while auto-translate is active, so the expected key is
+memoized per primary line instance in an `Expando`: weak keys, so an entry
+dies with the line and no eviction policy is needed.
+
+The invariant the memo relies on: a `TranscriptLine`'s `text` is never mutated
+after construction (`TranscriptLine` is `@immutable`), and the normalized text
+and the language base tags are pure functions of it. The memo records the
+language pair it was derived for and re-derives when the pair changes, so a
+target-language switch costs one derivation per line rather than one per
+rebuild.
+
+## Cue identity
+
+[`cueIdFor`](../../lib/features/transcript/domain/transcript_blur.dart) is the
+single source of truth for which `TranscriptLine` maps to which blur-reveal
+provider entry: it strips the inline markup, trims the text, and hashes the
+result together with the line's start and end. Every transcript tile derives
+that id while it builds — once for the reveal provider key, again for the
+reveal check, and again on each tap-reveal hold — and the active tile rebuilds
+at word-boundary rate during karaoke playback, so the same line was stripped,
+hashed, and stringified over and over on the UI isolate. The markup parse
+itself was already cached by content, so the repeat path paid for the trim, the
+FNV-1a walk, and the id string.
+
+The id is now memoized per line instance in an `Expando`: weak keys, so an
+entry dies with the line and no eviction policy is needed.
+
+The invariant the memo relies on: a `TranscriptLine`'s `text`, `startMs`, and
+`durationMs` are never mutated after construction (`TranscriptLine` is
+`@immutable`), so a cached id stays valid for the instance's lifetime. The
+memo is keyed by instance identity, so two value-equal lines keep their own
+entries and still derive the same id.
+
+## Recording overlap counts
+
+[`countRecordingsPerLineIndex`](../../lib/features/transcript/domain/transcript_recording_counts.dart)
+answers "how many shadow-reading takes overlap this cue?" for every cue of a
+media. The counts feed the recording badge on each transcript row and the
+practice-poster stats, and the whole set is recomputed whenever the transcript
+lines or the recordings change.
+
+The overlap rule is `max(startA, startB) < min(endA, endB)`. Applying it by
+scanning every recording for every cue costs `lines × recordings`. Instead the
+recording windows are projected onto two sorted lists — their start times and
+their end times — and each cue is resolved with two binary searches. A cue
+overlaps exactly the recordings that started before the cue ends, minus the
+ones that ended at or before the cue starts. Those two sets are nested (a
+recording that ended at or before the cue started also started before the cue
+ends), so their difference is the overlap count and the two sorted projections
+are enough to answer every cue.
+
+A window of non-positive length never overlaps anything, so it contributes
+nothing: a recording with a zero or negative duration contributes no window,
+and a cue with a zero or negative duration has no count.
+
+## Echo card tile reuse
+
+[`EchoRegionMergedCard`](../../lib/features/transcript/presentation/transcript_echo_region_merged_card.dart)
+is one item of the virtualized transcript list, so every list rebuild
+rebuilds it — and it used to rebuild every cue of the echo range on every
+rebuild. Nothing caps the loop length, so the cost scaled with it: a cue
+change over a 300-line loop rebuilt 300 `TranscriptLineTile`s in one frame
+(~120 ms — a dropped frame), while a typical few-line loop was free.
+
+The card now keeps one cached tile per line and reuses the **same widget
+instance** when that line's inputs are unchanged, so Flutter's
+identical-widget short-circuit skips the line's whole subtree. A cue change
+over a 300-line loop rebuilds 2 tiles — the outgoing and the incoming active
+cue — instead of 300: ~120 ms → ~15 ms per cue change.
+
+A cached tile is reused only while its inputs record is unchanged: the line,
+`isActive`, the resolved secondary text, `canRetranslate`,
+`wavyWordIndexes`, the recording count, and the loop font size. The card
+drops the whole cache when the transcript `lines` list identity changes, the
+`mediaId` changes, or the echo range moves.
+
+The invariant the cache relies on: a line's inputs fully determine how its
+tile renders, and the card never serves a tile built against a superseded
+transcript. Provider-driven rebuilds inside a tile (karaoke highlight, blur,
+tap-reveal) and inherited-driven rebuilds (theme, locale, media query) are
+unaffected — a tile subscribes to those itself, so the short-circuit only
+prunes parent-driven rebuilds.
+
+Auto-translate request scheduling stays per line per build, exactly as
+before: the policy depends on controller state read at build time, and the
+controller dedupes in-flight requests and pumps its own queue.
+
+`reuseUnchangedTiles: false` rebuilds every tile on every build — the
+pre-optimization path — so the microbenchmark in
+[`transcript_echo_region_card_rebuild_perf_test.dart`](../../test/features/transcript/transcript_echo_region_card_rebuild_perf_test.dart)
+can measure both sides in one process.
+
+## Alignment engine (Craft save + on-demand enrich)
+
+`packages/forced_alignment` maps known text + 16 kHz extractable PCM to
+word/phone timings (Echogarden-shaped result, flatten adapter for enjoy-web
+`WordTiming` / `PhoneTiming`). Production success requires a same-language
+**spoken** eSpeak-NG reference (waveform + word/phone events), not a
+duration-model tone stand-in. Missing voice → `spokenReferenceUnavailable`.
+**Craft save** is the automatic product caller ([ADR-0073](../decisions/0073-craft-timeline-enrichment.md) /
+[ADR-0076](../decisions/0076-stacked-ipa-player-controls.md)):
+every real (non-dedupe) Craft write attempts `alignSegments` and may attach
+nested spans onto spec 030 lines. **On-demand enrich** ([ADR-0078](../decisions/0078-on-demand-transcript-enrichment.md))
+is the CC-sheet button: owned media (local file **or** the learner’s cloud
+`mediaUrl`) extracts 16 kHz mono PCM via
+[`pcm16k_mono.dart`](../../lib/data/audio/pcm16k_mono.dart) (**FFmpegKit** on
+Android/iOS/macOS; CLI `ffmpeg` on Windows and Linux, including a binary next
+to the Linux app/AppImage). Cloud HTTP(S) URLs are first downloaded with Dart
+[`http`](../../lib/data/audio/http_media_download.dart) so FFmpeg only sees a
+local file on every platform. While a long file runs per-cue extract + `align()`,
+the enrich tile shows **cue N of M** plus a determinate bar and stays tappable
+to cancel. YouTube phonemizes
+caption text (untimed words + IPA labels, no demux). Karaoke highlight
+([ADR-0074](../decisions/0074-karaoke-word-highlight.md))
+and IPA display ([ADR-0076](../decisions/0076-stacked-ipa-player-controls.md))
+only **read** stored spans when their player transcript toggles are on **and**
+capability gating allows it; they do not run alignment on open/play/seek.
+Learners never hear the spoken reference. Import / YouTube / ASR remain
+line-only writers until enrich. macOS embeds `libespeak-ng.dylib` and iOS
+embeds `eSpeakNG.framework` plus the trimmed voice data (see
+[packaging.md](../packaging.md#espeak-ng-alignment-reference)). Android
+extracts the same tree from Flutter assets and must include `espeak-ng-data/lang/`
+(Flutter does not recurse directory assets) or `espeak_SetVoiceByName`
+fails; a missing lib on other packaged hosts still fail-closes. See
+[ADR-0071](../decisions/0071-on-device-alignment-engine.md)
+and [ADR-0072](../decisions/0072-spoken-alignment-reference.md).
+
+The Craft save hook and the on-demand enrich run **one** alignment pipeline
+([`align_lines_to_pcm.dart`](../../lib/data/subtitle/align_lines_to_pcm.dart)):
+decode 16 kHz mono PCM → align one segment per line (segment id = line index)
+→ attach the word/phone spans back onto the lines → validate that the line
+count did not change. Only the failure vocabulary differs — Craft fails closed
+and keeps today’s line timings, the CC-sheet enrich reports a typed reason
+(`audioUnavailable` / `internal` / the engine’s failure reason / `cancelled` /
+`line count changed`). The long-file path stays **per-cue** (extract + `align()`
+against a padded window) because it aligns one cue at a time rather than the
+whole file; it keeps its own segment assembly.
+
+## Transcript editor (⋯ More → Edit transcript)
+
+The player's ⋯ More menu and the phone Subtitles & display sheet list
+**Edit transcript** as the first row of the Transcript section (v30 `Main`
+board) whenever at least one transcript track exists for the media
+(`allTranscriptsForMediaProvider`). The entry is `transcript-action-edit` in
+[`transcript_actions.dart`](../../lib/features/transcript/presentation/transcript_actions.dart);
+both surfaces render the same `watchTranscriptActions` list.
+
+Choosing it pushes `/player/:mediaId/edit-transcript`
+([`TranscriptEditorScreen`](../../lib/features/transcript/presentation/transcript_editor_screen.dart)),
+a child of the player route: the player stays mounted underneath, so playback
+keeps running (the transport stays in the dock) and the leave-player teardown
+does not fire. The editor loads the active primary transcript row (falling
+back to the first track when no session is active) and lays each cue out as a
+paper card with the line text plus **Start (seconds)** / **Duration
+(seconds)** fields.
+
+Save goes through `TranscriptRepository.replaceTimeline` (`transcriptDao.upsert`
+plus timeline-cache invalidation), so the same-second revision nudge and the
+`(updated_at, jsonLength)` decode-memo key keep working and the player's
+transcript watches re-emit the edited lines live. Rules:
+
+- Timing fields accept decimal seconds (`1.25` ⇒ 1250 ms); malformed input
+  never reaches the field (the formatter rejects the edit as typed) and a
+  blank / unparseable value still blocks the save with a notice, writing
+  nothing.
+- Leaving the editor with unsaved edits (back button or system back) asks
+  for confirmation before discarding; a successful save pops without the
+  prompt.
+- A cue's nested word timings survive only while its text is unchanged; once
+  the text changes they no longer match and are dropped
+  (`editedTranscriptLine` in
+  [`transcript_line_editing.dart`](../../lib/features/transcript/domain/transcript_line_editing.dart)),
+  so karaoke / IPA falls back to line-level display instead of highlighting
+  stale words.
+- Saving marks the row `syncStatus: 'local'`, the normal sync upload path.
+
+Scope: the editor edits existing cues only — no add / delete / reorder of
+lines and no secondary (translation) track editing.
+
+## Network proxy
+
+The YouTube Tier 1 (worker cache) and Tier 2 (direct InnerTube) fetches run on `dart:io` and follow the OS system proxy on desktop ([network-proxy.md](network-proxy.md), ADR-0103); behind a system-proxy VPN they no longer bypass the tunnel. Transport-level failures append a `Hint:` naming the proxy mode.
+
+## Future
+
+- Multiple languages, cue add / delete / reorder, export — parity with web
+  `TranscriptDisplay`.

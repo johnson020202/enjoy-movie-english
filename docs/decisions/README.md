@@ -1,0 +1,129 @@
+# Architecture Decision Records
+
+ADRs are **immutable** after merge. To change a decision, add a new ADR that **supersedes** the old one.
+
+## Template
+
+```markdown
+# ADR-NNNN: Title
+
+## Status
+Proposed | Accepted | Superseded by ADR-XXXX
+
+## Context
+What problem are we solving?
+
+## Decision
+What did we choose?
+
+## Consequences
+Trade-offs, follow-up work, risks.
+```
+
+## Index
+
+| ID | Title |
+|----|-------|
+| [0001](0001-state-management-riverpod.md) | State management with Riverpod 3 |
+| [0002](0002-persistence-drift.md) | Local persistence with Drift |
+| [0003](0003-player-core-media-kit.md) | media_kit as sole player engine |
+| [0004](0004-feature-first-architecture.md) | Feature-first directory layout |
+| [0005](0005-mvp-scope-local-only.md) | MVP scope — local files only |
+| [0006](0006-auth-and-profile-sync.md) | Auth, profile, settings sync (browser flow) |
+| [0007](0007-dynamic-color-from-artwork.md) | Dynamic color from media artwork (**superseded by 0093**) |
+| [0008](0008-light-mode-parity.md) | Light mode parity |
+| [0009](0009-platform-adaptive-shell.md) | Platform-adaptive shell nuances |
+| [0010](0010-cloud-sync-mvp.md) | Cloud sync MVP — metadata (audio/video/recording) |
+| [0011](0011-dark-mode-only.md) | Dark mode only + logo-aligned brand (supersedes 0008; **superseded by 0083**) |
+| [0012](0012-per-user-sqlite-isolation.md) | Per-user SQLite + secure profile cache (partial supersession of 0006) |
+| [0013](0013-local-first-sync.md) | Local-first cloud sync + Cloud index (supersedes 0010 download behavior on player) |
+| [0014](0014-ai-capabilities-layer.md) | AI capabilities layer (Enjoy worker + capability pattern; BYOK/local placeholders) |
+| [0015](0015-youtube-playback.md) | YouTube playback via WebView + HTML5 video (dual engine with media_kit) |
+| [0016](0016-enjoy-account-webview-sign-in.md) | Enjoy account sign-in via in-app WebView (partial supersession of 0006) |
+| [0017](0017-azure-pronunciation-assessment.md) | Azure pronunciation assessment via native Flutter plugin (token-only) |
+| [0018](0018-shared-interactive-primitives.md) | Shared interactive primitives — EnjoyTappable, Haptics, EnjoyButton |
+| [0019](0019-transcript-dictionary-lookup.md) | Transcript dictionary lookup — selection scope, bottom sheet, worker APIs |
+| [0020](0020-android-windows-release-identity.md) | Android app ID `ai.enjoy.player`, release signing via `key.properties`, Windows release branding + Inno installer |
+| [0021](0021-youtube-discover-rss.md) | YouTube discovery via RSS feeds and local channel subscriptions (superseded by 0051) |
+| [0022](0022-unified-library-navigation.md) | Unified Library navigation — local + cloud source switch |
+| [0023](0023-app-update-distribution.md) | App update distribution — store no-op, direct feeds on dl.enjoy.bot |
+| [0024](0024-download-landing-page.md) | Download landing page — static site on Cloudflare Pages at player.enjoy.bot |
+| [0025](0025-youtube-player-block-google-signin-nav.md) | Block Google sign-in navigations in YouTube player WebView (supplements 0015) |
+| [0026](0026-local-production-diagnostics.md) | Local production diagnostics — rotating logs, opt-in verbose, zip export |
+| [0027](0027-native-auth-v2.md) | Native auth v2 — Google, Apple, email OTP, PKCE fallback (supersedes 0016 WebView-primary) |
+| [0028](0028-agentic-engine-choice.md) | Agentic workflow engine choice — third-party Anthropic-compatible proxy; Amendment 1 (2026-10-30): every workflow moved to GLM (`open.bigmodel.cn`), the egress gate derives sanctioned hosts from the shared engine components |
+| [0029](0029-supply-chain-risk.md) | Supply-chain risk for pre-release and local-path dependencies |
+| [0030](0030-flutter-lints-baseline-no-custom-lint.md) | Expanded flutter_lints baseline; defer custom_lint |
+| [0031](0031-login-only-access.md) | Login-only application access — auth gate, welcome sign-in hub, guest migration removed |
+| [0032](0032-platform-scoped-subscription-purchase.md) | Platform-scoped Pro purchase — desktop external checkout; mobile IAP deferred |
+| [0033](0033-byok-ai-provider-settings.md) | BYOK AI provider settings — per-modality Enjoy vs BYOK, secure secrets, direct vendor HTTP |
+| [0034](0034-custom-scheme-only-pkce-callback.md) | Custom-scheme-only PKCE callback — drops universal/app links (partial supersession of 0027) |
+| [0035](0035-responsive-transport-priorities.md) | Responsive transport priorities and collapsed-expand recovery |
+| [0036](0036-youtube-bilingual-transcripts.md) | YouTube bilingual transcripts via multi-language worker contract |
+| [0037](0037-transcript-auto-translate.md) | Transcript auto-translate (AI secondary track + lazy scheduler; superseded by 0038 for orchestration; display/identity supplemented by 0039) |
+| [0038](0038-viewport-per-line-auto-translate.md) | Viewport-driven per-line auto-translate (supersedes 0037 orchestration) |
+| [0039](0039-auto-translate-primary-text-keyed-overlay.md) | Auto-translate as primary-text keyed overlay (index display + sourceKey; supplements 0037/0038) |
+| [0040](0040-asr-transcript-generation.md) | ASR transcript generation |
+| [0041](0041-unified-tier-reconciliation.md) | Unified tier reconciliation — single source of truth + global resume/cold-start reconcile |
+| [0042](0042-multi-language-lookup-catalog.md) | Multi-language lookup catalog — decoupled source / target language pickers for transcript dictionary lookup |
+| [0043](0043-craft-from-text-import.md) | Craft from text import — single entry, two modes, BYOK parity for TTS |
+| [0044](0044-deterministic-end-of-media-completion-loop.md) | Deterministic end-of-media handling with generation-guarded completion loop |
+| [0045](0045-ai-result-cache-hierarchy.md) | Unified two-tier AI result cache (L1 LRU+TTL / L2 Drift) and `AiCacheFingerprint` keying |
+| [0046](0046-discover-feed-append-only.md) | Discover feed cache is append-only between unsubscribe events |
+| [0047](0047-youtube-discover-innertube.md) | InnerTube `browse` as primary source for YouTube channel discover (superseded by 0051) |
+| [0048](0048-linux-platform-support.md) | Linux as a first-class supported desktop platform (AppImage) (the R1 / R6 YouTube opt-out is **superseded by 0091**) |
+| [0049](0049-youtube-language-aware-captions.md) | YouTube language-aware caption discovery & primary selection |
+| [0050](0050-path-linked-local-media.md) | Path-linked local media — prefer lasting link, copy fallback (partial supersession of 0005 import storage) |
+| [0051](0051-youtube-worker-discovery.md) | YouTube discovery via server-side RSSHub proxy (supersedes 0021 and 0047) |
+| [0052](0052-vocabulary-local-first-schema.md) | Vocabulary local-first Drift schema (items/contexts/reviews; sync deferred) |
+| [0053](0053-vocabulary-secondary-route.md) | Vocabulary secondary route (Profile entry; not a primary shell tab) |
+| [0054](0054-vocabulary-cloud-sync.md) | Vocabulary cloud sync — SRS-preserving item conflict, LWW contexts, reviews never sync, auto-pull exception to ADR-0013 (extends ADR-0010) |
+| [0055](0055-adaptive-page-layout-system.md) | Adaptive page layout system (`EnjoyPage` / browse·hub·form widths) |
+| [0056](0056-uservideo-library-membership.md) | UserVideo library membership + content-addressed video uploads (partially supersedes 0013 for video upload ids) |
+| [0057](0057-permanent-player-surface-host.md) | Permanent RootShell player surface host (clip portal + launch pipeline) |
+| [0058](0058-enjoy-deepgram-long-form-asr.md) | Enjoy long-form ASR via Worker Deepgram jobs (≥900s upload/submit/poll) |
+| [0059](0059-phone-tablet-orientation-and-player-aspect-layout.md) | Phone portrait lock / tablet rotate; player stack vs side-by-side by window aspect |
+| [0060](0060-craft-voice-express-dual-mode.md) | Craft Voice-Express dual-mode redesign — voice-first Express (default) + Advanced two-tool layout |
+| [0061](0061-craft-first-class-history.md) | Craft first-class Home entry, global hotkey, history list, edit-in-place |
+| [0062](0062-craft-history-remove-keeps-audio.md) | Remove Craft history record keeps practice audio (`provider` → `user`) |
+| [0063](0063-craft-blank-transcript-without-solid-timings.md) | Craft blank transcript without solid word timings (no duration estimates) |
+| [0064](0064-word-pronounce-client.md) | Word pronounce client — Worker `/pronounce` + shared tap-to-play control (lookup / flashcard / assessment) |
+| [0065](0065-enjoy-modals-root-navigator.md) | Enjoy modals default to root navigator (above PlayerSurfaceHost; supplements 0057) |
+| [0066](0066-park-player-surface-for-overlays.md) | Park PlayerSurfaceHost while dialogs/sheets/snackbars are visible (WebView2 z-order; supplements 0057/0065) |
+| [0067](0067-github-release-publishing.md) | GitHub Release publishing — per-platform workflows keep building, idempotent draft uploads, coordinator finalizes notes |
+| [0068](0068-shadow-toolbar-share-button.md) | Share practice poster moved from transcript overlay into shadow-reading toolbar's leading slot; visibility narrows to echo mode + recordings |
+| [0069](0069-feature-onboarding-showcaseview.md) | Feature onboarding tips — Enjoy-owned catalog/progress + showcaseview overlays |
+| [0070](0070-nested-transcript-timeline.md) | Additive nested word/phone spans on stored transcript cues, matching enjoy web `timeline`/`phones` (line identity unchanged; no UI yet) |
+| [0071](0071-on-device-alignment-engine.md) | On-device alignment engine (`packages/forced_alignment`) — Echogarden result interface, unused by product flows |
+| [0072](0072-spoken-alignment-reference.md) | Spoken alignment reference — eSpeak-NG `espeak_Synth` FFI, fail-closed, unused by product (supplements 0071) |
+| [0073](0073-craft-timeline-enrichment.md) | Craft timeline enrichment — opt-in Craft save is the first product caller of `alignSegments` (default off, fail-closed) |
+| [0074](0074-karaoke-word-highlight.md) | Karaoke word highlight — opt-in in-place current-word highlight from stored timings (default off; independent of Craft enrichment) |
+| [0075](0075-word-level-practice.md) | Word-level practice + stored IPA overlay — two default-off Settings toggles; annotation-layer IPA; hit-test seek; ephemeral loop; inspect sheet (no G2P / play-time alignment / new Player) |
+| [0076](0076-stacked-ipa-player-controls.md) | Stacked IPA columns + familiar mapping + Noto Sans; tap IPA to play; karaoke/IPA in CC subtitle sheet; eSpeak phoneme UTF-8; Craft enrichment always-on (supersedes 0073 default-off + 0075 overlay/inspect/Settings hub) |
+| [0077](0077-audio-reserved-collapse-chrome.md) | Audio expanded chrome is a compact body collapse chevron (no blank AppBar); video keeps in-stage overlay (audio clause superseded by 0085) |
+| [0078](0078-on-demand-transcript-enrichment.md) | On-demand transcript enrichment — gated karaoke/IPA, explicit CC-sheet generate, owned `alignSegments`, YouTube IPA-only untimed words (supplements 0070; supersedes 0076 “no generate path” for this button only) |
+| [0079](0079-azure-word-boundaries-stay-craft-timing-source.md) | Azure TTS word boundaries stay the Craft line-timing source — rejects #540 §5 deprecation; boundaries = cue windows, DTW = nested word/phone spans |
+| [0080](0080-macos-security-scoped-bookmarks.md) | macOS security-scoped bookmarks for path-linked local media — sandbox-restart resilience + file-move resilience for externally linked imports (supplements ADR-0050) |
+| [0081](0081-crafted-audio-cloud-sync.md) | Crafted audio cloud sync — Active Storage direct-upload of TTS binaries for cross-device playback |
+| [0082](0082-home-continue-no-mini-player.md) | Home Continue practicing card; no global mini player; leave player clears live session (supersedes ADR-0035 E1–E7) |
+| [0083](0083-paper-graphite-light-dark.md) | Paper / graphite dual theme + System/Light/Dark appearance (supersedes 0011; palette, chrome, and type superseded by 0089) |
+| [0084](0084-linux-google-signin-off-and-pkce-deeplink.md) | Disable native Google Sign-In on Linux (ADR-0048 kill switch); GTK single-instance `enjoyplayer://` forwarding + AppImage scheme registration for PKCE callbacks |
+| [0085](0085-audio-floating-collapse-chrome.md) | Audio expanded chrome is the shared floating frosted collapse control over the transcript; desktop gets a roomier top inset (supersedes 0077 audio clause; **superseded by 0093**) |
+| [0086](0086-posthog-product-analytics.md) | PostHog product analytics integration |
+| [0087](0087-norwegian-bokmal-language-catalog.md) | Norwegian Bokmål (`nb-NO`) joins the focus / media / lookup catalogs; `no` / `nob` / `nor` alias to `nb` as deliberate policy (Nynorsk `nn` stays unsupported) |
+| [0088](0088-discover-feed-owns-library-membership.md) | Discover feed owns library membership — one merged watch, tiles render `inLibrary`, `bindLibraryRepository` deleted (issue #764 candidate 6; ADR-0046 cache unchanged) |
+| [0089](0089-aurora-design-language.md) | Aurora design language — porcelain / midnight neutrals, iris accent + aurora glow, Geist / Instrument Serif / Geist Mono, vendored Phosphor icons (`EnjoyIcons`), superellipse shapes, no ripples, one glide transition, floating content panel + glass tab bar (supersedes 0083 §1/§4/§5; **superseded by 0093** except §4 icons, §6 interaction, §7 motion) |
+| [0090](0090-one-language-descriptor-row.md) | One language descriptor row — `kLanguageDescriptorRows` is the single source every language catalog derives from; enumerating pin tests became derivation checks (issue #794 candidate 1; ADR-0042 separation and ADR-0087 alias policy unchanged) |
+| [0091](0091-youtube-linux-playback.md) | YouTube playback on Linux via the WPE WebKit backend — runtime availability probe replaces the ADR-0048 opt-out; `flutter_inappwebview` 6.2.0-beta exact pin; WPE+GStreamer bundled in the AppImage; Route B (extractor+media_kit) stays the documented fallback (specs/047) |
+| [0092](0092-linux-youtube-host-runtime.md) | Linux YouTube v1 ships with host-provided WPE runtime — WebProcess compile-time path makes bundled WPE unlaunchable; GStreamer plugins stay bundled; probe + graceful degrade covers missing hosts (amends 0091 FR-008 scope) |
+| [0093](0093-duet-design-language.md) | Duet design language — two voices (original blue / you violet) + brand gradient on ink neutrals, Literata / Geist / Geist Mono, Listen / Echo lenses on one transcript, player dock + side margin (lookup, assessment), uncolored scores, word-shape Hide text, flat surfaces; built on `design-duet` per `docs/design/duet/PLAN.md` (supersedes 0089 except §4/§6/§7, 0007, 0085) |
+| [0094](0094-fastlane-store-uploads.md) | fastlane for store uploads and review actions — Play AAB via `supply`, TestFlight via `pilot`, submit/status via `deliver`/spaceship; builds stay with the release scripts, entry points and secrets unchanged; Python Play uploader deleted |
+| [0095](0095-declared-font-families-and-linux-cjk-fallback.md) | Declared multi-weight font families (Geist / Geist Mono / Literata / Noto Sans in `pubspec.yaml`) so `fontWeight` picks the right face; Linux runner points `FONTCONFIG_FILE` at a bundled config that keeps CJK glyph fallback on sans faces at every weight |
+| [0096](0096-native-azure-speech-sdk-on-linux.md) | Native Azure Speech SDK on Linux — `packages/azure_speech/linux` plugin built against the same pinned NuGet SDK as Windows (linux-x64 / linux-arm64 core + OpenSSL shims bundled with `$ORIGIN` RUNPATH); assess / transcribe / synthesize run natively, REST fallbacks removed |
+| [0097](0097-ci-dependency-cache-and-cn-mirrors.md) | CI dependency caching over the LAN `gh-sr-cache` server — `actions/cache` for `~/.pub-cache`, a deliberately narrowed Gradle subset, and per-job CocoaPods; `PUB_HOSTED_URL` / `FLUTTER_STORAGE_BASE_URL` mirrors as the cache-miss fallback (hash-pinned lockfile keeps integrity intact); reverses the prior "never use `actions/cache`" policy (issue #912); container pool only — native macOS/Windows runners exempt per 0099 |
+| [0098](0098-linux-youtube-software-gl-recovery.md) | Linux YouTube software-GL recovery persists across launches — stall verdict writes a marker the Linux runner reads before engine init; in-session webview rebuild removed (amends 0092's T047 fallback) |
+| [0099](0099-native-runner-dependency-cache.md) | Native macOS/Windows runners keep dependency caches on disk — `actions/cache` scoped to the gh-sr container pool (whose per-job reset is a container-image hook); `build_apple`/`build_windows` drop the ~1 GB/job GitHub-cache round-trip; Apple/Windows release workflows get only the `FLUTTER_STORAGE_BASE_URL` SDK mirror (no `PUB_HOSTED_URL`, so tagged builds honor the committed lock) (amends 0097) |
+| [0100](0100-macos-direct-download-keychain.md) | macOS secure storage on the Developer ID direct-download channel — no keychain access group (AMFI `-413` kills the app), one shared legacy-keychain backend, deletes treat `errSecMissingEntitlement` as already absent (issue #1044) |
+| [0101](0101-flutter-engine-artifact-prefetch.md) | Prefetch the Flutter engine Android artifacts into a local Maven repository — `tool/prefetch_flutter_engine_android_libs.sh` fetches `io.flutter:*` with retries and Range resume so the build never depends on the mirror's TLS handshakes; `android/build.gradle.kts` resolves them from disk; the dependency cache saves move after the build so they capture what it downloaded (amends 0097) |
+| [0102](0102-macos-compat-dylibs-macos-12-floor.md) | macOS compat dylibs pin the bundle to the deployment target, not the build machine — Homebrew-referenced dylibs build from sha256-pinned sources at `MACOSX_DEPLOYMENT_TARGET=12.0` (freetype stays 2.13.3, pre-HVF), the bundler resolves that prefix before kegs, and two gates (minos floor + macOS 12 `/usr/lib` allowlist) turn bottle-tag regressions into build failures (issue #1187) |
+| [0103](0103-proxy-aware-http-stack.md) | Proxy-aware Dart HTTP stack — `HttpOverrides.global` follows the macOS/Windows system proxy (parsed `scutil` / registry, 60 s refresh, loopback + exception bypass, env fallback) so captions and other Dart requests work behind system-proxy VPNs with Settings → Network System/Manual/Direct modes, effective-proxy row and connection test (issue #1220) |

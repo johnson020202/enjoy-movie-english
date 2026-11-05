@@ -1,0 +1,311 @@
+/// Local Drift library lists (audio rows / video grid).
+library;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:enjoy_player/core/layout/enjoy_page_kind.dart';
+import 'package:enjoy_player/core/presentation/relative_day_label.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/widgets/empty_state.dart';
+import 'package:enjoy_player/core/theme/widgets/error_state.dart';
+import 'package:enjoy_player/core/theme/widgets/media_card.dart';
+import 'package:enjoy_player/core/theme/widgets/skeleton.dart';
+import 'package:enjoy_player/features/library/application/library_media_provider.dart';
+import 'package:enjoy_player/features/library/application/library_search_provider.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+import 'package:enjoy_player/features/player/application/player_controller.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+import 'library_media_card.dart';
+
+/// Tab bodies for local library media, driven by a shared [TabController].
+class LocalLibraryTabView extends ConsumerWidget {
+  const LocalLibraryTabView({required this.tabController, super.key});
+
+  final TabController tabController;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final listsAsync = ref.watch(libraryFilteredListsProvider);
+    final counts = ref.watch(libraryKindCountsProvider).asData?.value;
+    final query = ref.watch(librarySearchProvider);
+    final l10n = AppLocalizations.of(context)!;
+
+    return listsAsync.when(
+      data: (lists) {
+        return TabBarView(
+          controller: tabController,
+          children: [
+            LocalVideoLibraryBody(
+              items: lists.video,
+              searchQuery: query,
+              totalInLibraryOfKind: counts?.video ?? 0,
+            ),
+            LocalAudioLibraryBody(
+              items: lists.audio,
+              searchQuery: query,
+              totalInLibraryOfKind: counts?.audio ?? 0,
+            ),
+          ],
+        );
+      },
+      loading: () => TabBarView(
+        controller: tabController,
+        children: const [SkeletonMediaGrid(), SkeletonMediaList()],
+      ),
+      error: (e, _) => ErrorState(
+        message: '${l10n.error}: $e',
+        onRetry: () => ref.invalidate(libraryFilteredListsProvider),
+      ),
+    );
+  }
+}
+
+class LocalAudioLibraryBody extends StatelessWidget {
+  const LocalAudioLibraryBody({
+    required this.items,
+    required this.searchQuery,
+    required this.totalInLibraryOfKind,
+    super.key,
+  });
+
+  final List<Media> items;
+  final String searchQuery;
+  final int totalInLibraryOfKind;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return _LocalLibraryBody(
+      items: items,
+      searchQuery: searchQuery,
+      totalInLibraryOfKind: totalInLibraryOfKind,
+      emptyTitle: l10n.libraryEmptyAudioTitle,
+      emptyHint: l10n.libraryEmptyAudioHint,
+      contentSliver: (context, items, _) {
+        final t = EnjoyThemeTokens.of(context);
+        return DecoratedSliver(
+          decoration: ShapeDecoration(
+            color: t.paper,
+            shape: RoundedSuperellipseBorder(
+              borderRadius: BorderRadius.circular(t.radiusCard),
+              side: BorderSide(color: t.line),
+            ),
+          ),
+          sliver: SliverList.separated(
+            itemCount: items.length,
+            separatorBuilder: (context, _) =>
+                Divider(height: 1, thickness: 1, color: t.line),
+            itemBuilder: (context, index) => LocalAudioRow(media: items[index]),
+          ),
+        );
+      },
+    );
+  }
+}
+
+typedef _LibraryBodyGeometry = ({double inset, double maxWidth});
+
+class _LocalLibraryBody extends StatelessWidget {
+  const _LocalLibraryBody({
+    required this.items,
+    required this.searchQuery,
+    required this.totalInLibraryOfKind,
+    required this.emptyTitle,
+    required this.emptyHint,
+    required this.contentSliver,
+  });
+
+  final List<Media> items;
+  final String searchQuery;
+  final int totalInLibraryOfKind;
+  final String emptyTitle;
+  final String emptyHint;
+  final Widget Function(
+    BuildContext context,
+    List<Media> items,
+    _LibraryBodyGeometry geometry,
+  )
+  contentSliver;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+
+    if (items.isEmpty) {
+      final filteredBySearch =
+          searchQuery.isNotEmpty && totalInLibraryOfKind > 0;
+      if (filteredBySearch) {
+        return EmptyState(
+          title: l10n.librarySearchNoMatchesTitle,
+          subtitle: l10n.librarySearchNoMatchesHint,
+          action: () {
+            final notifier = ProviderScope.containerOf(
+              context,
+            ).read(librarySearchProvider.notifier);
+            notifier.clear();
+          },
+          actionLabel: l10n.librarySearchClear,
+        );
+      }
+      return EmptyState(title: emptyTitle, subtitle: emptyHint);
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final inset = libraryBodyInset(context, constraints.maxWidth);
+        return CustomScrollView(
+          slivers: [
+            if (searchQuery.isNotEmpty)
+              LibrarySearchResultLine(
+                count: items.length,
+                query: searchQuery,
+                inset: inset,
+              ),
+            SliverPadding(
+              padding: EdgeInsets.fromLTRB(inset, t.space4, inset, t.space32),
+              sliver: contentSliver(context, items, (
+                inset: inset,
+                maxWidth: constraints.maxWidth,
+              )),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Browse-column inset for library bodies (matches the page header).
+double libraryBodyInset(BuildContext context, double paneWidth) =>
+    EnjoyPageMetrics.of(
+      context,
+      kind: EnjoyPageKind.browse,
+      paneWidth: paneWidth,
+    ).horizontalInset;
+
+/// "2 matches for “ferry”" above search results.
+class LibrarySearchResultLine extends StatelessWidget {
+  const LibrarySearchResultLine({
+    super.key,
+    required this.count,
+    required this.query,
+    required this.inset,
+  });
+
+  final int count;
+  final String query;
+  final double inset;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+    return SliverPadding(
+      padding: EdgeInsets.fromLTRB(inset, 2, inset, 14),
+      sliver: SliverToBoxAdapter(
+        child: Text(
+          l10n.librarySearchResults(count, query),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(fontSize: 13, color: t.ink3),
+        ),
+      ),
+    );
+  }
+}
+
+class LocalAudioRow extends ConsumerWidget {
+  const LocalAudioRow({required this.media, super.key});
+
+  final Media media;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final playingId = ref.watch(
+      playerControllerProvider.select((s) => s?.mediaId),
+    );
+    final locale = Localizations.localeOf(context).toLanguageTag();
+
+    return LibraryMediaRow(
+      media: media,
+      subtitle: l10n.libraryTileAdded(
+        relativeDayLabel(l10n, locale, media.createdAt),
+      ),
+      heroArtworkMediaId: playingId == media.id ? null : media.id,
+    );
+  }
+}
+
+class LocalVideoLibraryBody extends StatelessWidget {
+  const LocalVideoLibraryBody({
+    required this.items,
+    required this.searchQuery,
+    required this.totalInLibraryOfKind,
+    super.key,
+  });
+
+  final List<Media> items;
+  final String searchQuery;
+  final int totalInLibraryOfKind;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return _LocalLibraryBody(
+      items: items,
+      searchQuery: searchQuery,
+      totalInLibraryOfKind: totalInLibraryOfKind,
+      emptyTitle: l10n.libraryEmptyVideoTitle,
+      emptyHint: l10n.libraryEmptyVideoHint,
+      contentSliver: (context, items, geometry) {
+        final crossAxisExtent = geometry.maxWidth - geometry.inset * 2;
+        return SliverGrid(
+          gridDelegate: mediaCardTileGridDelegateForMinTileWidth(
+            crossAxisExtent: crossAxisExtent,
+            minTileWidth: _kLibraryTileMinWidth,
+            mainAxisSpacing: 24,
+            crossAxisSpacing: 20,
+          ),
+          delegate: SliverChildBuilderDelegate(
+            (context, index) => Align(
+              alignment: Alignment.topCenter,
+              child: LocalVideoTile(media: items[index]),
+            ),
+            childCount: items.length,
+          ),
+        );
+      },
+    );
+  }
+}
+
+const double _kLibraryTileMinWidth = 210;
+
+class LocalVideoTile extends ConsumerWidget {
+  const LocalVideoTile({required this.media, super.key});
+
+  final Media media;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final playingId = ref.watch(
+      playerControllerProvider.select((s) => s?.mediaId),
+    );
+    final locale = Localizations.localeOf(context).toLanguageTag();
+
+    return LibraryMediaTile(
+      media: media,
+      subtitle: l10n.libraryTileAdded(
+        relativeDayLabel(l10n, locale, media.createdAt),
+      ),
+      isVideo: true,
+      languagePlacement: MediaCardLanguagePlacement.title,
+      heroArtworkMediaId: playingId == media.id ? null : media.id,
+    );
+  }
+}

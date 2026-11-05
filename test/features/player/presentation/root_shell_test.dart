@@ -1,0 +1,829 @@
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:drift/native.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_bottom_nav.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_chrome_icon.dart';
+import 'package:enjoy_player/features/player/presentation/widgets/app_sidebar.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/features/library/application/continue_practice_provider.dart';
+import 'package:enjoy_player/features/player/application/player_controller.dart';
+import 'package:enjoy_player/features/player/application/player_engine_test_double_provider.dart';
+import 'package:enjoy_player/features/player/application/player_state_providers.dart';
+import 'package:enjoy_player/features/player/domain/playback_session.dart';
+import 'package:enjoy_player/features/player/presentation/root_shell.dart';
+import 'package:enjoy_player/features/player/presentation/widgets/player_dock.dart';
+import 'package:enjoy_player/features/auth/domain/user_profile.dart';
+import 'package:enjoy_player/features/discover/application/discover_providers.dart';
+import 'package:enjoy_player/features/subscription/application/subscription_status_provider.dart';
+import 'package:enjoy_player/features/subscription/domain/subscription_status.dart';
+import 'package:enjoy_player/features/sync/application/sync_controller.dart';
+import 'package:enjoy_player/features/transcript/application/all_transcripts_provider.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_blur_mode_provider.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_fetch_controller.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_lines_provider.dart';
+import 'package:enjoy_player/features/transcript/domain/transcript_fetch_status.dart';
+import 'package:enjoy_player/features/transcript/domain/transcript_track.dart';
+import 'package:enjoy_player/features/update/application/update_controller.dart';
+import 'package:enjoy_player/features/vocabulary/application/vocabulary_review_session.dart';
+import 'package:enjoy_player/features/vocabulary/domain/vocabulary_review_practice.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../helpers/chrome_icon_finders.dart';
+import '../../../support/fake_player_engine.dart';
+
+const _kShellMediaId = 'shell-transport-test';
+
+PlaybackSession _shellSession() {
+  final now = DateTime(2026, 1, 1);
+  return PlaybackSession(
+    mediaId: _kShellMediaId,
+    dexieTargetType: 'Audio',
+    mediaType: 'audio',
+    mediaTitle: 'Shell transport test',
+    durationSeconds: 120,
+    currentTimeSeconds: 0,
+    currentSegmentIndex: 0,
+    language: 'en',
+    startedAt: now,
+    lastActiveAt: now,
+  );
+}
+
+class _FakeVocabSession extends VocabularyReviewSession {
+  _FakeVocabSession({ReviewSessionState? initial})
+    : _initial = initial ?? const ReviewSessionState(queue: []);
+
+  final ReviewSessionState _initial;
+
+  @override
+  ReviewSessionState build() => _initial;
+}
+
+class _NullPlayerController extends PlayerController {
+  _NullPlayerController();
+
+  @override
+  PlaybackSession? build() => null;
+}
+
+class _SessionPlayerController extends PlayerController {
+  _SessionPlayerController(this._session);
+
+  PlaybackSession? _session;
+
+  @override
+  PlaybackSession? build() => _session;
+
+  @override
+  Future<void> clear({bool keepVideoSurface = false}) async {
+    _session = null;
+    state = null;
+  }
+}
+
+class _BlurModeOff extends TranscriptBlurMode {
+  @override
+  bool build() => false;
+}
+
+GoRouter _router({required String initial}) {
+  return GoRouter(
+    initialLocation: initial,
+    routes: [
+      ShellRoute(
+        builder: (context, state, child) => RootShell(child: child),
+        routes: [
+          GoRoute(
+            path: '/',
+            builder: (_, _) => const Scaffold(body: Text('home-page')),
+          ),
+          GoRoute(
+            path: '/discover',
+            builder: (_, _) => const Scaffold(body: Text('discover-page')),
+          ),
+          GoRoute(
+            path: '/library',
+            builder: (_, _) => const Scaffold(body: Text('library-page')),
+          ),
+          GoRoute(
+            path: '/profile',
+            builder: (_, _) => const Scaffold(body: Text('profile-page')),
+          ),
+          GoRoute(
+            path: '/settings',
+            builder: (_, _) => const Scaffold(body: Text('settings-page')),
+          ),
+          GoRoute(
+            path: '/subscription',
+            builder: (_, _) => const Scaffold(body: Text('subscription-page')),
+          ),
+          GoRoute(
+            path: '/credits',
+            builder: (_, _) => const Scaffold(body: Text('credits-page')),
+          ),
+          GoRoute(
+            path: '/vocabulary',
+            builder: (_, _) => const Scaffold(body: Text('vocabulary-page')),
+          ),
+          GoRoute(
+            path: '/cloud',
+            builder: (_, _) => const Scaffold(body: Text('cloud-page')),
+          ),
+          GoRoute(
+            path: '/player/:mediaId',
+            builder: (_, _) => const Scaffold(body: Text('player-page')),
+          ),
+          GoRoute(
+            path: '/youtube/login',
+            builder: (_, _) => const Scaffold(body: Text('youtube-login-page')),
+          ),
+          GoRoute(
+            path: '/vocabulary',
+            builder: (_, _) => const Scaffold(body: Text('vocabulary-page')),
+          ),
+          GoRoute(
+            path: '/vocabulary/review',
+            builder: (_, _) =>
+                const Scaffold(body: Text('vocabulary-review-page')),
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+List<Override> _shellOverrides(
+  AppDatabase db, {
+  ReviewSessionState? vocab,
+  bool updateBadge = false,
+  PlaybackSession? playerSession,
+  FakePlayerEngine? playerEngine,
+}) {
+  final overrides = <Override>[
+    appDatabaseProvider.overrideWithValue(db),
+    deviceGlobalAppDatabaseProvider.overrideWithValue(db),
+    continuePracticeResumeProvider.overrideWith((ref) => null),
+    syncCtrlProvider.overrideWithValue(0),
+    discoverFeedRefreshSchedulerProvider.overrideWithValue(0),
+    updateAvailableBadgeProvider.overrideWithValue(updateBadge),
+    subscriptionStatusProvider.overrideWith(
+      (ref) async => const SubscriptionStatus(
+        subscriptionActive: false,
+        subscriptionTier: SubscriptionTier.free,
+      ),
+    ),
+    vocabularyReviewSessionProvider.overrideWith(
+      () => _FakeVocabSession(initial: vocab),
+    ),
+  ];
+
+  if (playerSession == null) {
+    overrides.add(
+      playerControllerProvider.overrideWith(_NullPlayerController.new),
+    );
+  } else {
+    final engine = playerEngine ?? FakePlayerEngine();
+    overrides.addAll([
+      playerEngineTestDoubleProvider.overrideWithValue(engine),
+      playerControllerProvider.overrideWith(
+        () => _SessionPlayerController(playerSession),
+      ),
+      transcriptHasLinesForMediaProvider(
+        playerSession.mediaId,
+      ).overrideWith((ref) => Stream.value(false)),
+      playerIsPlayingProvider.overrideWith((ref) => Stream.value(false)),
+      playerIsBufferingProvider.overrideWith((ref) => Stream.value(false)),
+      allTranscriptsForMediaProvider(
+        playerSession.mediaId,
+      ).overrideWith((ref) => Stream.value(const <TranscriptTrack>[])),
+      transcriptFetchCtrlProvider(playerSession.mediaId).overrideWithValue(
+        const TranscriptFetchUiState(status: TranscriptFetchStatus.idle),
+      ),
+      transcriptBlurModeProvider.overrideWith(_BlurModeOff.new),
+    ]);
+  }
+
+  return overrides;
+}
+
+/// `testWidgets` with an in-body teardown: the shell's drift streams
+/// schedule zero-duration timers when the tree unmounts, and the binding
+/// keeps a test's tree alive into the next test — so every shell test
+/// unmounts and flushes before the pending-timer invariant runs.
+void shellTest(String description, Future<void> Function(WidgetTester) body) {
+  testWidgets(description, (tester) async {
+    try {
+      await body(tester);
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 1));
+    }
+  });
+}
+
+Future<void> _pump(
+  WidgetTester tester, {
+  required GoRouter router,
+  required List<Override> overrides,
+  required Size surface,
+}) async {
+  addTearDown(router.dispose);
+  await tester.binding.setSurfaceSize(surface);
+  addTearDown(() => tester.view.resetPhysicalSize());
+
+  final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF7B61FF));
+  await tester.pumpWidget(
+    ProviderScope(
+      overrides: overrides,
+      child: MaterialApp.router(
+        theme: ThemeData(
+          colorScheme: scheme,
+          extensions: [EnjoyThemeTokens.build(scheme)],
+        ),
+        locale: const Locale('en', 'US'),
+        localizationsDelegates: const [
+          AppLocalizations.delegate,
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+        supportedLocales: AppLocalizations.supportedLocales,
+        routerConfig: router,
+      ),
+    ),
+  );
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 100));
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late AppDatabase db;
+  late FakePlayerEngine fakeEngine;
+
+  setUp(() {
+    db = AppDatabase(executor: NativeDatabase.memory());
+    fakeEngine = FakePlayerEngine();
+  });
+
+  tearDown(() async {
+    await db.close();
+    await fakeEngine.dispose();
+  });
+
+  group('RootShell narrow layout (mobile)', () {
+    shellTest('renders bottom nav with Home selected at /', (tester) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('home-page'), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.home), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.compass), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.library), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+
+    shellTest('floats bottom nav over a transparent scaffold with extendBody', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      final shellScaffolds = tester
+          .widgetList<Scaffold>(find.byType(Scaffold))
+          .where((s) => s.bottomNavigationBar != null)
+          .toList();
+      expect(shellScaffolds, hasLength(1));
+      expect(shellScaffolds.first.backgroundColor, Colors.transparent);
+      expect(shellScaffolds.first.extendBody, isTrue);
+      expect(find.byType(EnjoyBottomNav), findsOneWidget);
+      final content = tester.widget<Padding>(
+        find.byKey(const ValueKey<String>('root-shell-content')),
+      );
+      expect(
+        content.padding.resolve(TextDirection.ltr).bottom,
+        EnjoyBottomNav.contentHeight,
+      );
+    });
+
+    shellTest('selects Discover icon at /discover', (tester) async {
+      final router = _router(initial: '/discover');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(findChromeIcon(EnjoyChromeGlyph.compass), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.home), findsOneWidget);
+    });
+
+    shellTest('selects Library icon at /library', (tester) async {
+      final router = _router(initial: '/library');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(findChromeIcon(EnjoyChromeGlyph.library), findsOneWidget);
+    });
+
+    shellTest('selects Profile icon at /profile', (tester) async {
+      final router = _router(initial: '/profile');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(findChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+
+    shellTest('selects Profile icon at /settings', (tester) async {
+      final router = _router(initial: '/settings');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(findChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+
+    shellTest('selects Profile icon at /subscription', (tester) async {
+      final router = _router(initial: '/subscription');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('subscription-page'), findsOneWidget);
+      expect(findFilledChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+
+    shellTest('selects Profile icon at /credits', (tester) async {
+      final router = _router(initial: '/credits');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('credits-page'), findsOneWidget);
+      expect(findFilledChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+
+    shellTest('selects Profile icon at /vocabulary', (tester) async {
+      final router = _router(initial: '/vocabulary');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('vocabulary-page'), findsOneWidget);
+      expect(findFilledChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+
+    shellTest('selects Library icon at /cloud', (tester) async {
+      final router = _router(initial: '/cloud');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(findChromeIcon(EnjoyChromeGlyph.library), findsOneWidget);
+    });
+
+    shellTest('does not render bottom nav on /player/abc', (tester) async {
+      final router = _router(initial: '/player/abc');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+      expect(find.text('player-page'), findsOneWidget);
+    });
+
+    shellTest('still renders bottom nav on /youtube/login', (tester) async {
+      final router = _router(initial: '/youtube/login');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.byType(EnjoyBottomNav), findsOneWidget);
+      expect(find.text('youtube-login-page'), findsOneWidget);
+    });
+  });
+
+  group('RootShell wide layout (rail sidebar)', () {
+    shellTest('uses AppSidebar instead of bottom nav at >= breakpoint', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(1100, 900),
+      );
+
+      expect(find.byIcon(EnjoyIcons.search), findsOneWidget);
+      expect(find.byType(AppSidebar), findsOneWidget);
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+      expect(findChromeIcon(EnjoyChromeGlyph.home), findsOneWidget);
+    });
+
+    shellTest('does not render AppSidebar when on /player/abc', (tester) async {
+      final router = _router(initial: '/player/abc');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(1100, 900),
+      );
+
+      expect(find.byIcon(EnjoyIcons.search), findsNothing);
+      expect(find.text('player-page'), findsOneWidget);
+    });
+  });
+
+  group('RootShell vocabulary review practice', () {
+    shellTest('does not show mini transport when practice owns video stage', (
+      tester,
+    ) async {
+      final router = _router(initial: '/library');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(
+          db,
+          vocab: const ReviewSessionState(
+            queue: [],
+            practicePhase: ReviewPracticePhase.clipReady,
+          ),
+        ),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.byIcon(EnjoyIcons.play), findsNothing);
+    });
+
+    shellTest('tapping bottom-nav Discover navigates to /discover', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(router.state.uri.path, '/');
+      await tester.tap(findChromeIcon(EnjoyChromeGlyph.compass));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(router.state.uri.path, '/discover');
+    });
+
+    shellTest('tapping bottom-nav Library navigates to /library', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      await tester.tap(findChromeIcon(EnjoyChromeGlyph.library));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(router.state.uri.path, '/library');
+    });
+
+    shellTest('tapping bottom-nav Profile navigates to /profile', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      await tester.tap(findChromeIcon(EnjoyChromeGlyph.user));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(router.state.uri.path, '/profile');
+    });
+
+    shellTest('tapping bottom-nav Home navigates back to /', (tester) async {
+      final router = _router(initial: '/discover');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      await tester.tap(findChromeIcon(EnjoyChromeGlyph.home));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(router.state.uri.path, '/');
+    });
+
+    shellTest('updateAvailableBadgeProvider=true shows profile semantics', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db, updateBadge: true),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('home-page'), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.user), findsWidgets);
+    });
+
+    shellTest('shows transport on /player/ with an active session', (
+      tester,
+    ) async {
+      final router = _router(initial: '/player/$_kShellMediaId');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(
+          db,
+          playerSession: _shellSession(),
+          playerEngine: fakeEngine,
+        ),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('player-page'), findsOneWidget);
+      expect(find.byType(PlayerDock), findsOneWidget);
+    });
+
+    shellTest(
+      'floats player transport over a transparent scaffold with extendBody',
+      (tester) async {
+        final router = _router(initial: '/player/$_kShellMediaId');
+        await _pump(
+          tester,
+          router: router,
+          overrides: _shellOverrides(
+            db,
+            playerSession: _shellSession(),
+            playerEngine: fakeEngine,
+          ),
+          surface: const Size(400, 900),
+        );
+
+        final shellScaffolds = tester
+            .widgetList<Scaffold>(find.byType(Scaffold))
+            .where((s) => s.bottomNavigationBar != null)
+            .toList();
+        expect(shellScaffolds, hasLength(1));
+        expect(shellScaffolds.first.backgroundColor, Colors.transparent);
+        expect(shellScaffolds.first.extendBody, isTrue);
+        expect(find.byType(PlayerDock), findsOneWidget);
+      },
+    );
+
+    shellTest('does not show mini transport on / even with a session', (
+      tester,
+    ) async {
+      final router = _router(initial: '/');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(
+          db,
+          playerSession: _shellSession(),
+          playerEngine: fakeEngine,
+        ),
+        surface: const Size(400, 900),
+      );
+      await tester.pump();
+      expect(find.byType(PlayerDock), findsNothing);
+    });
+
+    shellTest('does not show mini transport bar when no player session', (
+      tester,
+    ) async {
+      final router = _router(initial: '/library');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.byIcon(EnjoyIcons.play), findsNothing);
+      expect(find.byIcon(EnjoyIcons.mic), findsNothing);
+    });
+
+    shellTest('renders AppBackground and shell at /profile', (tester) async {
+      final router = _router(initial: '/profile');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('profile-page'), findsOneWidget);
+      expect(findChromeIcon(EnjoyChromeGlyph.user), findsOneWidget);
+    });
+  });
+
+  group('RootShell immersive vocabulary review', () {
+    shellTest('hides AppSidebar on /vocabulary/review (wide)', (tester) async {
+      final router = _router(initial: '/vocabulary/review');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(1100, 900),
+      );
+
+      expect(find.text('vocabulary-review-page'), findsOneWidget);
+      expect(find.byIcon(EnjoyIcons.search), findsNothing);
+      expect(find.byType(AppSidebar), findsNothing);
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+    });
+
+    shellTest('hides bottom nav on /vocabulary/review (narrow)', (
+      tester,
+    ) async {
+      final router = _router(initial: '/vocabulary/review');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.text('vocabulary-review-page'), findsOneWidget);
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+      expect(findChromeIcon(EnjoyChromeGlyph.compass), findsNothing);
+    });
+
+    shellTest(
+      'hides mini transport on /vocabulary/review with active session',
+      (tester) async {
+        final router = _router(initial: '/vocabulary/review');
+        await _pump(
+          tester,
+          router: router,
+          overrides: _shellOverrides(
+            db,
+            playerSession: _shellSession(),
+            playerEngine: fakeEngine,
+          ),
+          surface: const Size(1100, 900),
+        );
+
+        expect(find.text('vocabulary-review-page'), findsOneWidget);
+        expect(find.byType(PlayerDock), findsNothing);
+        expect(find.byIcon(EnjoyIcons.play), findsNothing);
+      },
+    );
+
+    shellTest('does not show mini transport on /vocabulary hub with session', (
+      tester,
+    ) async {
+      final router = _router(initial: '/vocabulary');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(
+          db,
+          playerSession: _shellSession(),
+          playerEngine: fakeEngine,
+        ),
+        surface: const Size(1100, 900),
+      );
+
+      expect(find.text('vocabulary-page'), findsOneWidget);
+      expect(find.byType(PlayerDock), findsNothing);
+    });
+
+    shellTest('restores sidebar after leaving /vocabulary/review (wide)', (
+      tester,
+    ) async {
+      final router = _router(initial: '/vocabulary/review');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(1100, 900),
+      );
+
+      expect(find.byIcon(EnjoyIcons.search), findsNothing);
+
+      router.go('/vocabulary');
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('vocabulary-page'), findsOneWidget);
+      expect(find.byIcon(EnjoyIcons.search), findsOneWidget);
+    });
+
+    shellTest(
+      'does not restore mini transport after leaving review with a session',
+      (tester) async {
+        final router = _router(initial: '/vocabulary/review');
+        await _pump(
+          tester,
+          router: router,
+          overrides: _shellOverrides(
+            db,
+            playerSession: _shellSession(),
+            playerEngine: fakeEngine,
+          ),
+          surface: const Size(400, 900),
+        );
+
+        expect(find.byType(PlayerDock), findsNothing);
+
+        router.go('/library');
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.text('library-page'), findsOneWidget);
+        expect(find.byType(PlayerDock), findsNothing);
+      },
+    );
+
+    shellTest('keeps chrome hidden when resizing while on /vocabulary/review', (
+      tester,
+    ) async {
+      final router = _router(initial: '/vocabulary/review');
+      await _pump(
+        tester,
+        router: router,
+        overrides: _shellOverrides(db),
+        surface: const Size(400, 900),
+      );
+
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+
+      await tester.binding.setSurfaceSize(const Size(1100, 900));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('vocabulary-review-page'), findsOneWidget);
+      expect(find.byIcon(EnjoyIcons.search), findsNothing);
+      expect(find.byType(AppSidebar), findsNothing);
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+
+      await tester.binding.setSurfaceSize(const Size(400, 900));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.byType(EnjoyBottomNav), findsNothing);
+    });
+  });
+}

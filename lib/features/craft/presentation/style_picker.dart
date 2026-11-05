@@ -1,0 +1,68 @@
+/// Style picker dropdown for the translate tool.
+library;
+
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:flutter/material.dart';
+
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/features/craft/domain/translation_style.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+class StylePicker extends StatelessWidget {
+  const StylePicker({super.key, required this.value, required this.onChanged});
+
+  final TranslationStyle value;
+  final void Function(TranslationStyle) onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final theme = Theme.of(context);
+    final t = EnjoyThemeTokens.of(context);
+    return Row(
+      children: [
+        Icon(EnjoyIcons.sparkleFill, size: 18, color: t.brandInk),
+        SizedBox(width: t.space8),
+        Text(
+          l10n.craftStyleLabel,
+          style: theme.textTheme.labelLarge?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        SizedBox(width: t.space12),
+        Expanded(
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<TranslationStyle>(
+              value: value,
+              isExpanded: true,
+              borderRadius: BorderRadius.circular(t.radiusMd),
+              items: TranslationStyle.values.map((style) {
+                return DropdownMenuItem(
+                  value: style,
+                  child: Text(_label(l10n, style)),
+                );
+              }).toList(),
+              onChanged: (s) {
+                if (s != null) onChanged(s);
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _label(AppLocalizations l10n, TranslationStyle style) {
+    return switch (style) {
+      TranslationStyle.auto => l10n.craftStyleAuto,
+      TranslationStyle.literal => l10n.craftStyleLiteral,
+      TranslationStyle.natural => l10n.craftStyleNatural,
+      TranslationStyle.casual => l10n.craftStyleCasual,
+      TranslationStyle.formal => l10n.craftStyleFormal,
+      TranslationStyle.simplified => l10n.craftStyleSimplified,
+      TranslationStyle.detailed => l10n.craftStyleDetailed,
+      TranslationStyle.custom => l10n.craftStyleCustom,
+    };
+  }
+}

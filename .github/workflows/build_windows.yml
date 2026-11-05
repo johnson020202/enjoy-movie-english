@@ -1,0 +1,142 @@
+name: Build Windows
+
+on:
+  # PRs build only when native, dependency or build-tooling inputs change;
+  # Dart-only changes are covered by CI (analyze + tests) on the PR and by
+  # this build on the push to main. Run it on a PR branch on demand with:
+  #   gh workflow run build_windows.yml --ref <branch>
+  pull_request:
+    paths:
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "windows/**"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/scripts/use_short_windows_workdir.ps1"
+      - ".github/scripts/ensure_vs_cpp_atl.ps1"
+      - ".github/scripts/ensure_nuget_feed.ps1"
+      - ".github/workflows/build_windows.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "lib/**"
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "analysis_options.yaml"
+      - "windows/**"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/scripts/use_short_windows_workdir.ps1"
+      - ".github/scripts/ensure_vs_cpp_atl.ps1"
+      - ".github/scripts/ensure_nuget_feed.ps1"
+      - ".github/workflows/build_windows.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Dependency downloads must not reach pub.dev / storage.googleapis.com through
+# the per-GB proxy; these mirrors are routed DIRECT. pubspec.lock pins every
+# package by sha256, so a mirror serving different bytes fails the hash check.
+# PUB_HOSTED_URL changes the default hosted source, so pub re-resolves the lock
+# against the mirror in this build job (versions can move within constraints);
+# the release workflow omits PUB_HOSTED_URL so a tag ships the exact versions in
+# its committed pubspec.lock.
+env:
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, windows, flutter]
+    steps:
+      - uses: actions/checkout@v6
+
+      # No actions/cache for the pub cache: on Windows the Dart/Flutter pub
+      # cache lives at %LOCALAPPDATA%\Pub\Cache — NOT ~/.pub-cache, so the
+      # previous restore/save pair referenced a path that never exists here
+      # (every save failed with "Path Validation Error … no cache is being
+      # saved"; nothing was ever cached or restored). The real cache persists
+      # natively on this self-hosted runner between jobs, and the LAN cache
+      # server only exists for gh-sr container runners anyway.
+
+      - name: Short workspace path (Windows MAX_PATH)
+        shell: pwsh
+        run: .github/scripts/use_short_windows_workdir.ps1
+
+      # flutter_secure_storage_windows needs ATL (atlstr.h); the component can
+      # vanish from a self-hosted host after a VS update/re-provision, so
+      # detect-and-install idempotently before building.
+      - name: Ensure VS C++ ATL
+        shell: pwsh
+        run: .github/scripts/ensure_vs_cpp_atl.ps1
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Ensure NuGet feed (WebView2 / flutter_inappwebview)
+        shell: pwsh
+        run: .github/scripts/ensure_nuget_feed.ps1
+
+      - name: Flutter pub get
+        working-directory: ${{ env.GITHUB_WORKSPACE }}
+        run: flutter pub get
+
+      # package:sqlite3 3.x downloads its prebuilt library from
+      # github.com/simolus3/sqlite3.dart/releases with Dart HttpClient (no
+      # retries), so a dropped TLS handshake fails the whole build with
+      # "Building native assets failed". Prefetch into the dart_build shared
+      # cache with curl (which retries) so the hook reuses it. The Apple,
+      # Android and Linux paths prefetch the same way.
+      #
+      # shell: bash — this runner's default shell is pwsh, which would pass
+      # the trailing backslash through as a literal argument.
+      - name: Prefetch sqlite3 Windows native libs
+        shell: bash
+        working-directory: ${{ env.GITHUB_WORKSPACE }}
+        run: bash tool/prefetch_sqlite3_libs.sh windows || echo "::warning::prefetch_sqlite3_libs skipped; the dart_build hook will fetch on its own"
+
+      # The staged workspace is recreated (and windows\ffmpeg excluded) every
+      # run, so fetching straight into it re-downloaded ~100 MB from gyan.dev
+      # each time (~8 min, and the step that flaked). RUNNER_TOOL_CACHE
+      # survives between jobs on this native runner, same as the Flutter SDK:
+      # fetch there once (the script is a no-op when the binary already runs)
+      # and copy into the build tree.
+      - name: Ensure Windows FFmpeg
+        shell: pwsh
+        working-directory: ${{ env.GITHUB_WORKSPACE }}
+        run: |
+          $cached = Join-Path $env:RUNNER_TOOL_CACHE 'ffmpeg-release-essentials\ffmpeg.exe'
+          windows/scripts/fetch_ffmpeg.ps1 -OutputPath $cached
+          New-Item -ItemType Directory -Force -Path windows/ffmpeg | Out-Null
+          Copy-Item -Path $cached -Destination windows/ffmpeg/ffmpeg.exe -Force
+
+      - name: Flutter build windows (debug)
+        working-directory: ${{ env.GITHUB_WORKSPACE }}
+        env:
+          AZURE_SPEECH_SDK_CACHE: ${{ runner.tool_cache }}\azure-speech-sdk
+        run: flutter build windows --debug
+
+      - name: Flutter build windows (release)
+        working-directory: ${{ env.GITHUB_WORKSPACE }}
+        env:
+          AZURE_SPEECH_SDK_CACHE: ${{ runner.tool_cache }}\azure-speech-sdk
+        run: flutter build windows --release
+
+      - name: Remove short workspace stage
+        if: always()
+        shell: pwsh
+        run: |
+          $baseName = Split-Path -Leaf $env:GITHUB_WORKSPACE
+          $shortPath = Join-Path 'C:\e' $baseName
+          if (Test-Path $shortPath) { Remove-Item -Path $shortPath -Recurse -Force }

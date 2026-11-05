@@ -1,0 +1,119 @@
+import 'dart:async';
+
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/media_registry.dart';
+import 'package:enjoy_player/data/db/media_registry_provider.dart';
+import 'package:enjoy_player/features/craft/application/craft_history_provider.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+/// Reads the first emitted value of a [StreamProvider] by keeping a
+/// listener alive for the duration of the read. `container.read(...future)`
+/// alone does not retain a subscription long enough for a cold
+/// (non-broadcast) stream to emit before the provider is torn down.
+Future<List<Media>> _firstValue(
+  ProviderContainer container,
+  StreamProvider<List<Media>> provider,
+) async {
+  final completer = Completer<List<Media>>();
+  final sub = container.listen(provider, (_, next) {
+    if (next.hasValue && !completer.isCompleted) {
+      completer.complete(next.requireValue);
+    } else if (next.hasError && !completer.isCompleted) {
+      completer.completeError(next.error!, next.stackTrace);
+    }
+  }, fireImmediately: true);
+  try {
+    return await completer.future.timeout(const Duration(seconds: 5));
+  } finally {
+    sub.close();
+  }
+}
+
+/// Stand-in for the `AppDatabase` the fake never touches: `watchByProvider` is
+/// the only override, so no Drift machinery is booted (issue #768 review).
+class _UnusedDb implements AppDatabase {
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw UnimplementedError('fake registry never touches the db');
+}
+
+class _FakeMediaRegistry extends MediaRegistry {
+  _FakeMediaRegistry(this._items) : super(_UnusedDb());
+
+  final List<Media> _items;
+
+  @override
+  Stream<List<Media>> watchByProvider(String provider) {
+    final items = _items.where((item) => item.provider == provider).toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return Stream.value(items);
+  }
+}
+
+Media _media({
+  required String id,
+  required String provider,
+  required DateTime updatedAt,
+}) {
+  return Media(
+    id: id,
+    kind: MediaKind.audio,
+    title: 'Item $id',
+    sourceUri: 'file:///$id.wav',
+    durationMs: 1000,
+    language: 'en-US',
+    contentHash: id,
+    fileSize: 10,
+    provider: provider,
+    createdAt: updatedAt,
+    updatedAt: updatedAt,
+  );
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('filters to provider = craft and sorts newest-updated first', () async {
+    final now = DateTime.now();
+    final items = [
+      _media(id: 'user-1', provider: 'user', updatedAt: now),
+      _media(
+        id: 'craft-old',
+        provider: 'craft',
+        updatedAt: now.subtract(const Duration(days: 1)),
+      ),
+      _media(id: 'youtube-1', provider: 'youtube', updatedAt: now),
+      _media(
+        id: 'craft-new',
+        provider: 'craft',
+        updatedAt: now.add(const Duration(minutes: 5)),
+      ),
+    ];
+    final repo = _FakeMediaRegistry(items);
+
+    final container = ProviderContainer(
+      overrides: [mediaRegistryProvider.overrideWithValue(repo)],
+    );
+    addTearDown(container.dispose);
+
+    final result = await _firstValue(container, craftHistoryProvider);
+
+    expect(result.map((m) => m.id).toList(), ['craft-new', 'craft-old']);
+  });
+
+  test('emits an empty list when there are no craft items', () async {
+    final repo = _FakeMediaRegistry([
+      _media(id: 'user-1', provider: 'user', updatedAt: DateTime.now()),
+    ]);
+
+    final container = ProviderContainer(
+      overrides: [mediaRegistryProvider.overrideWithValue(repo)],
+    );
+    addTearDown(container.dispose);
+
+    final result = await _firstValue(container, craftHistoryProvider);
+    expect(result, isEmpty);
+  });
+}

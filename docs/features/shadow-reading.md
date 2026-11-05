@@ -1,0 +1,177 @@
+# Feature: Shadow reading (echo)
+
+## Summary
+
+Shadow reading is the **record-while-you-listen** flow that lives below the **echo region** in the expanded player. The user listens to a cue, records themselves reading it back via the **shadow reading panel**, optionally runs **Azure pronunciation assessment** on the take, and (now) can **export a shareable practice poster** (see [`echo-mode.md`](echo-mode.md) and [`share-poster.md`](share-poster.md)).
+
+The panel is mounted when **echo mode is active** in the expanded player (with a usable transcript), and also in the vocabulary review **Echo reading** practice overlay (recorder-only, with the context sentence shown above the controls). Global record / play-take / pitch / assess hotkeys pulse `ShadowReadingHotkeyBus` whenever a player session is open **or** vocabulary echo practice is open.
+
+## Recording bus
+
+The recording bus is the single source of truth for "is the user recording right now":
+
+- `ShadowReadingHotkeyBus` (a singleton bus, generated from `shadow_reading_hotkey_bus.dart`) emits typed events (`ShadowRecordingHotkeyEvent`) when the user presses the global shortcut, toggling the panel's idle toolbar state. The bus decouples the hotkey layer (which knows nothing about the panel) from the UI.
+- The bus's `isRecordingActive` flag gates Escape dismissal priority. The panel sets it around capture and resets it on stop, cancel, and on panel teardown mid-recording — the teardown reset uses a notifier handle captured while the panel was live and is deferred onto the event loop, because riverpod forbids both provider access from a disposing `ConsumerState` and provider mutation from a widget lifecycle (review on #815). Pinned by `shadow_reading_panel_teardown_test.dart`.
+- Mic selection is persisted in `SettingsKeys.prefsRecordingInputDeviceId` and re-read on every take via `recordingInputDeviceCtrlProvider`. Unknown / virtual devices are skipped by `pickPreferredInputDeviceId` (GlideX Shared Audio, VoiceMeeter, VB-Audio CABLE, NVIDIA Broadcast, etc.) so Windows defaults don't silently capture only zeros.
+
+## Take capture & persistence (ShadowTakeStore)
+
+Mic capture and take persistence live in [`ShadowTakeStore`](../../lib/features/shadow_reading/application/shadow_take_store.dart) (issue #597) — the panel is view + callbacks only. Interface: `start(device:)` / `cancel()` / `stopAndPersist(region:)` / `deleteTake(row)` / `dispose()`.
+
+- **Capture**: mic permission gate, `{appSupport}/recordings/{uuid}.wav` paths, and the 16 kHz mono PCM16 WAV config (`buildShadowRecordConfig`, aligned with web + Azure Speech).
+- **Recorder lifecycle**: the `MicRecorder` port wraps `package:record`'s `AudioRecorder`; the recorder is **recreated after every `stop()`** — `record` on Windows keeps stale Media Foundation state on the same instance, so reusing it silently produces a zero-sample WAV ("second take won't record").
+- **Persistence**: `stopAndPersist` reads the WAV, computes sha256 + duration (from the RIFF `fmt ` + `data` header; a `fmt ` chunk shorter than 16 bytes yields no duration), applies the **silence heuristic** (RMS < 0.001 or non-zero ratio < 1% → `looksSilent` verdict surfaced by the panel as a warning; the row is persisted regardless), builds the `RecordingRow`, inserts via `recordingDao` (ADR-0002), then enqueues sync create through the injected `SyncEnqueueFn` (ADR-0013).
+- **Deletion**: `deleteTake` enqueues sync delete, removes the WAV file, then deletes the DAO row. Stopping preview playback of the take first is the panel's job (a presentation concern).
+
+### Wiring (issue #764)
+
+The panel no longer names a database handle. [`shadow_take_providers.dart`](../../lib/features/shadow_reading/application/shadow_take_providers.dart) owns three seams:
+
+- **`shadowTakeStoreFactoryProvider`** hands back a `ShadowTakeStoreFactory` already bound to `appDatabaseProvider` and `syncEnqueueProvider`. It is a **factory, not a store provider**: a store owns a `MicRecorder` (recreated after every stop) and an `_active` flag, and the panel is embedded more than once — transcript echo cards are list items — so several panels can be mounted at once. One shared store would let one panel's capture mark another as recording and would hand two panels the same recorder. The panel keeps ownership (and disposes the recorder in its own `dispose`); only the wiring moved.
+- **`echoRegionRecordingsProvider`** — the take list for one echo window.
+- **`echoRegionRecordingsOnceProvider`** — the same window as a one-shot read, for the playback / assessment hotkey handlers, which act on a single take and must not open a subscription per keypress.
+
+The panel's `RecordingRow` mentions are type-only (`app_database.dart` supplies the Drift row shape); it holds no database handle and issues no queries. These providers are hand-written rather than `@riverpod`-annotated because `riverpod_generator` raises `InvalidTypeException` on Drift row types and on function-typed returns (same workaround as `syncEnqueueProvider`).
+
+Craft's `CaptureStage` still owns its own capture loop (it needs the amplitude stream and does not persist takes); migrating it onto the shared `MicRecorder` port is a follow-up.
+
+## Idle toolbar (centered FAB)
+
+Two presentations share the panel (Duet, ADR-0093):
+
+- **Player embed** (`takesRowInLoop`, canvas v30): under the loop sits
+  **one takes row** (`ShadowTakeSummaryRow`) — play the selected take
+  (`G`), `Take 3 · 84` with its level word or `Not scored yet · click to
+  score` (tap runs the assessment, `V`; a scored take re-opens it), and
+  `3 takes ›`, which opens the **takes list** (`ShadowTakesListPanel`):
+  the player margin on desktop, a bottom sheet on phones. The list shows
+  every take newest first (play selects it; an uncolored mono score chip
+  re-opens the assessment, `Score` runs it), a **delete** per take with
+  confirm (decision R2), and **Pitch contour on the loop** (`P`). The
+  selected take and the pitch toggle are presentation state
+  (`selectedTakeProvider`, `loopPitchVisibleProvider`) so the row, the
+  list and the hotkeys agree. A new take lands unscored; nothing plays
+  after it on its own. With no takes the row reads "No recordings for
+  this segment yet. Press R and say it back." Record / cancel / stop live
+  in the dock; while a take records, the panel renders nothing and the
+  loop block shows the pulse label + countdown bar.
+- **Vocabulary embed**: the original **idle toolbar** with the **pitch
+  icon**, a centered **FAB** (start recording), **play**, and
+  **pronunciation assess**. Delete moves into a **more** menu gated by a
+  confirmation dialog. When recording is in flight, the panel swaps to
+  **recording-only focus**: FAB + countdown vs the active echo segment,
+  with the pitch chart and takes list hidden until the take is
+  committed. The countdown ring has a **single timing source** (review
+  on #815): one `Ticker` sets the elapsed seconds on an
+  `AnimationController` that exists purely as the painter's `repaint`
+  listenable inside a `RepaintBoundary` (issue #810 E2), so each vsync
+  **repaints the ring without rebuilding any element**, and the same
+  tick re-evaluates the over-target pulse phase and bumps a
+  `ValueNotifier<int>` of tenths-of-a-second. The elapsed caption is a
+  `ValueListenableBuilder` over that notifier, so it rebuilds 10 times a
+  second — never per frame, and with no second timer to drift from the
+  ring (issue #818). The notifier is deliberately **not** the
+  `AnimationController`: a `ListenableBuilder` on the controller would
+  rebuild the caption on every vsync, which is the cost the paint-only
+  design exists to avoid. Over-target state (error ring + pulse) still
+  rebuilds discretely on the flip and at the 600 ms pulse cadence. This
+  timebase is shared code now ([#1199](https://github.com/baizhiheizi/enjoy_player/issues/1199)):
+  `RecordingElapsedTicker` in
+  `lib/features/shadow_reading/presentation/widgets/recording_elapsed_ticker.dart`
+  also drives the transcript echo loop's recording readout, whose
+  over-target handling is intentionally caption-only.
+- All toolbar controls use **≥44×44** hit targets where possible; the
+  assessment badge control is **44×44** with explicit
+  `Semantics(label, button)` so VoiceOver / TalkBack see it as a
+  control, not only a tooltip.
+
+## Pitch contour
+
+When the user opts in, the panel runs **pitch contour** analysis on the take:
+
+1. `echo_segment_pcm_extractor.dart` extracts the relevant echo segment to a temp `.raw` via **FFmpeg** (CLI on Windows, FFmpegKit elsewhere). Extraction is **cancellable** (`EchoPcmCancelToken` kills the live FFmpeg process/session) and **bounded** by a per-call timeout; failures surface a typed `EchoPcmExtractionException` (e.g. `ffmpegMissing`) instead of a silent `null`. The invocation goes through the one shared runner ([`ffmpeg_argv_runner.dart`](../../lib/data/files/ffmpeg_argv_runner.dart)), which owns the CLI-vs-FFmpegKit dispatch, the killable process backend and the cancellable FFmpegKit backend; FFmpeg binary resolution goes through the single shared `FfmpegMediaProbe.resolveFfmpegExecutable()` (memoized for the process lifetime).
+2. The byte→Float32 **decode + YIN** (`yin_pitch.dart`) both run inside **one worker isolate** (`Isolate.run`), so the multi-megabyte PCM buffer never blocks the UI thread and never crosses an isolate port — only the ~520-point analysis result is returned.
+3. `echo_pitch_analysis_service.dart` caches results per region/recording (so re-opening a region reuses the analysis) and **cancels** — not merely discards — an in-flight extraction when the region/recording changes. Exposed as the keep-alive `echoPitchAnalysisServiceProvider`.
+4. `pitch_contour_chart.dart` renders the envelope; `pitch_contour_section.dart` exposes it as a collapsible section that can be **parent-driven** (`expanded`, `showHeader: false` for chart-only body). The merged reference+user series is **memoized** (`EchoMergedSeriesMemo`) so it is built once per (reference, user) pair — identical across playback ticks — and `shouldRepaint` compares the points by content so the painter skips work when only the progress cursor moves. The live position cursor feeds the chart through a leaf `Consumer` inside the panel that watches `displayPositionProvider` **only while the contour is expanded** (issue #810 E1), so the collapsed panel never subscribes and position ticks never rebuild the panel itself — only the contour subtree.
+5. The **voiced-run derivation** (gap split, short-run filter, octave fold, 5-point median filter) is **memoized per series** on the merged list's identity through the `pitchContourRuns` seam, so a playback tick re-uses the runs instead of re-deriving them (the derivation dominated the per-tick paint cost). The legend toggles gate each series lazily, so enabling one derives only that series; the cache entry dies with the list it was derived from — the merged series is never mutated after construction, so a cached run stays valid for the list's lifetime. Pinned by `pitch_contour_runs_perf_test.dart` (derivation count per series per list, plus differential equivalence against the unmemoized derivation).
+
+## Pronunciation assessment (Azure)
+
+The optional **pronunciation assessment** path runs after a take lands:
+
+1. `recording_assessment_controller.dart` requests a **Worker Azure speech token** from Enjoy (`POST /ai/pronunciation/token`) and passes it to the native `azure_speech` plugin. The Azure locale is resolved from the **media/recording language** via [`resolveAzureAssessmentLocaleForPractice`](../../lib/core/application/app_language_catalog.dart). Supported regional tags (e.g. `en-US`, `en-GB`, `es-ES`, `fr-CA`, `nb-NO`) are preserved. Unknown media tags (`und` / empty — typical for YouTube imports without a set content language) fall back to the learner's **focus language** (then `en-US` default). Real unsupported primaries still **disable** assessment with an explanatory tooltip — the app does **not** silently coerce those to `en-US`.
+2. The plugin returns a JSON `pronunciationScore` / `accuracyScore` / `fluencyScore` / `completenessScore` plus per-word detail. The result is persisted to the recording row (`pronunciation_score`, `assessment_json`).
+3. `AssessmentResultDialog` / sheet reopens the score when the user taps the score badge. The wide layout uses the **rail breakpoint** (900px), not the transcript breakpoint (720px).
+4. Take menu shows per-take scores and a **Re-assess** entry when the current take already has `assessment_json`.
+5. **Model pronounce on results** — The selected-word panel offers a shared **Pronounce** control ([ADR-0064](../decisions/0064-word-pronounce-client.md)) for the chosen chip word. It plays Worker model audio (standard pronunciation). Locale uses the same `resolveAzureAssessmentLocaleForPractice` path as the assessment run (`und`/empty media → learning language), not the raw recording tag.
+6. **Take replay + karaoke + word clips** — The result surface receives `recordingPath` (`RecordingRow.localPath`). A **Play my recording** control near the overall score replays the full take via the ADR-0003 `RecordingPreviewPlayer` (not `PlayerController`). While the full take plays, word chips get a karaoke-style “current” highlight from Azure per-word `Offset`/`Duration` ticks (converted to ms). Selecting a chip stops full-take playback. The selected-word panel also offers **Play my recording of this word** (timed clip via `playClip`); omissions / zero-duration words disable the clip. Model pronounce, full take, and word clip are mutually exclusive (starting one stops the others). Dismissing the dialog/sheet stops take/clip and model pronounce.
+
+Silent FFmpeg WAV normalize is auto-detected and the resample chain is retried (see commit history around Azure assessment). Zero-score runs are persisted and logged.
+
+**Credits rejection (spec 045)**: when the token request is rejected because Enjoy credits are exhausted (worker 402), the controller returns the dedicated `credits` failure kind carrying the envelope, and the flow shows the shared friendly message — required vs. remaining credits and reset time when provided — with the **View plans & packages** snackbar action. The recording is kept and re-assessment works after purchase; the raw status string never reaches the user.
+
+## Related
+
+- Echo mode (parent context): [`docs/features/echo-mode.md`](echo-mode.md)
+- Share practice poster (echo-tailored export): [`docs/features/share-poster.md`](share-poster.md)
+- AI capability routes (assessment, chat, translation): [`docs/features/ai.md`](ai.md)
+- Native speech package: `packages/azure_speech/`
+- ADR: [`docs/decisions/0005-mvp-scope-local-only.md`](../decisions/0005-mvp-scope-local-only.md) (echo + shadow reading scope)
+
+## Presentation — the assessment (Duet, ADR-0093)
+
+The assessment reads on raised paper: a level-colored ring around the
+Literata overall score with a level pill and a *Play my recording* button,
+colored bars for accuracy / completeness / fluency / prosody, then the
+word chips and the selected-word panel (see the color scale below).
+
+## Presentation — the pitch duet and takes (Duet, ADR-0093)
+
+The pitch chart draws the **pitch duet**: the reference contour as a 9 px
+original-blue band at 0.35 opacity, your contour as a 3 px you-violet
+line. Chips on takes are an ink number on a paper pill. The assessment
+result itself reads in color (user decision 2026-10-13, overriding the
+board's uncolored scores): `score_level.dart` maps Excellent / Good (≥ 81)
+to `scoreGood` green, Fair (61–80) to `scoreWarn` amber and Poor (< 61)
+to `scoreBad` red, each with its tinted container. The overall ring, the
+level pill, the dimension bars, the word chips (tinted fill + mono score;
+wavy underline for mispronunciation, strike-through for insertion and
+omission, a legend above), and the selected-word panel's per-phoneme tiles
+all use that scale; IPA renders in bundled Noto Sans. On wide player
+windows the assessment opens in the 360 px side margin — docked beside
+the content at ≥ 1100 px, a drawer route below — which hosts the same
+`AssessmentResultBody` as the narrow sheet (overall score, dimension
+bars, replay, re-assess, per-word phoneme analysis). Both margin forms
+wrap the panel in a transparent `Material` so plain text never falls
+back to the debug error style. An assessment or takes panel closes when
+the player leaves Echo; a word lookup stays.
+
+**Pitch chart.** Both contours sit on a semitone axis fitted to the voiced
+range (at least 8 semitones). A contour breaks at gaps over 250 ms, runs
+shorter than 60 ms are dropped, points more than 9 semitones from the
+median are folded back an octave (detector half/double-frequency errors),
+and each run is median-filtered over 5 points. There is no area fill: the
+reference is the 9 px translucent original-blue band, your take the 3 px
+you-violet line, over a quiet amplitude envelope. Legend toggles (Reference
+/ You / Waveform, each with its swatch) turn layers on and off. The Pitch
+button is enabled whenever Echo is on and the media is decodable, so the
+reference contour is available before the first take.
+
+**Pitch input.** The contour decodes the reference region with FFmpeg from
+`mediaAnalysisInputProvider`: the row's local file when it has one,
+otherwise its `http(s)` `mediaUrl`, so cloud-streamed library items get a
+contour too (FFmpeg seeks the remote file with `-ss` before `-i` and only
+fetches the segment). YouTube rows have no direct audio URL, so their Pitch
+button stays disabled. The input is read straight from the row, without
+opening a macOS security-scoped bookmark grant.
+
+**Linux.** Assessment runs the native Speech SDK through the
+`azure_speech` Linux plugin, the same path as the other platforms
+([ADR-0096](../decisions/0096-native-azure-speech-sdk-on-linux.md)). WAV
+normalization and the pitch-contour PCM extraction
+(`echo_segment_pcm_extractor.dart`) run the bundled or system `ffmpeg` CLI
+on Linux as on Windows — `FfmpegMediaProbe.usesFfmpegCli` picks the CLI
+wherever FFmpegKit ships no plugin (Windows, Linux). In the player the takes render as the strip under the loop
+(chips + Pitch pill); recording readouts (pulse label, countdown bar)
+render inside the loop block, and the dock carries Play/Pause + Record
+and Cancel + Stop.

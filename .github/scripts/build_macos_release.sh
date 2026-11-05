@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Compile macOS release for direct download (unsigned; signed in a post-step).
+#
+# flutter build macos does not forward xcodebuild settings after "--", so we
+# generate Xcode project files with config-only, then compile with
+# CODE_SIGNING_ALLOWED=NO (same approach as build_macos_ci.sh).
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "${root}"
+
+# shellcheck source=apple_spm_hygiene.sh
+source "${root}/.github/scripts/apple_spm_hygiene.sh"
+apple_sanitize_git_env_for_spm
+
+lib="$(dirname "$0")/release_lib.sh"
+# shellcheck source=release_lib.sh
+source "${lib}"
+
+dart_defines=(--dart-define=DISTRIBUTION_CHANNEL=direct)
+if [[ -n "${MACOS_RELEASE_DART_DEFINES:-}" ]]; then
+  # shellcheck disable=SC2206
+  dart_defines+=(${MACOS_RELEASE_DART_DEFINES})
+fi
+release_append_posthog_defines dart_defines
+
+build_release() {
+  # "$@" inside apple_with_spm_host_lock runs this function with errexit
+  # exempted, so every step must forward its own failure explicitly.
+  echo ">>> Configure macOS release"
+  apple_retry_spm_command "${root}" \
+    flutter build macos --release --config-only "${dart_defines[@]}" || return $?
+
+  echo ">>> xcodebuild Release (compile-only signing)"
+  apple_retry_spm_command "${root}" \
+    xcodebuild \
+    -workspace macos/Runner.xcworkspace \
+    -scheme Runner \
+    -configuration Release \
+    -derivedDataPath build/macos \
+    CODE_SIGNING_ALLOWED=NO \
+    build || return $?
+}
+
+apple_with_spm_host_lock build_release
+
+app_path="build/macos/Build/Products/Release/Enjoy Player.app"
+if [[ ! -d "${app_path}" ]]; then
+  echo "Missing release app bundle: ${app_path}" >&2
+  exit 1
+fi
+
+echo "Built: ${app_path}"

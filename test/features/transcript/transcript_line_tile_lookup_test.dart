@@ -1,0 +1,356 @@
+import 'package:enjoy_player/core/interaction/enjoy_pressable.dart';
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:enjoy_player/core/theme/app_theme.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/data/subtitle/transcript_line.dart';
+import 'package:enjoy_player/features/settings/application/karaoke_highlight_settings.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_blur_mode_provider.dart';
+import 'package:enjoy_player/features/transcript/presentation/transcript_line_tile.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+import '../../helpers/transcript_settings_overrides.dart';
+
+Widget transcriptTileHarness(Widget child) {
+  return ProviderScope(
+    overrides: [
+      transcriptBlurModeProvider.overrideWith(() => _BlurMode(false)),
+      karaokeHighlightSettingsProvider.overrideWith(_KaraokeHighlightOff.new),
+      ...transcriptWordPracticeOffOverrides(),
+    ],
+    child: MaterialApp(
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: Scaffold(body: child),
+    ),
+  );
+}
+
+class _BlurMode extends TranscriptBlurMode {
+  _BlurMode(this._initial);
+  final bool _initial;
+
+  @override
+  bool build() => _initial;
+}
+
+class _KaraokeHighlightOff extends KaraokeHighlightSettings {
+  @override
+  Future<bool> build() async => false;
+}
+
+void main() {
+  testWidgets('selectable transcript line uses SelectableText', (tester) async {
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: true,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: true,
+          onLookupRequested: (_) {},
+          onTap: () {},
+        ),
+      ),
+    );
+
+    expect(find.byType(SelectableText), findsOneWidget);
+  });
+
+  testWidgets('non-selectable transcript line uses plain Text.rich', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: false,
+          onTap: () {},
+        ),
+      ),
+    );
+
+    expect(find.byType(SelectableText), findsNothing);
+    expect(find.byType(EnjoyPressable), findsOneWidget);
+  });
+
+  testWidgets('grouped echo line remains tappable when not selectable', (
+    tester,
+  ) async {
+    var tapped = false;
+
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: true,
+          groupedInEcho: true,
+          selectable: false,
+          onTap: () => tapped = true,
+        ),
+      ),
+    );
+
+    expect(find.byType(SelectableText), findsNothing);
+    expect(find.byType(EnjoyPressable), findsOneWidget);
+
+    await tester.tap(find.text('Hello world'));
+
+    expect(tapped, isTrue);
+  });
+
+  testWidgets('lookup runs from selection toolbar after explicit tap', (
+    tester,
+  ) async {
+    String? lookedUp;
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: true,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: true,
+          onLookupRequested: (t) => lookedUp = t,
+          onTap: () {},
+        ),
+      ),
+    );
+
+    final textCenter = tester.getCenter(find.text('Hello world'));
+    await tester.tapAt(textCenter);
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.tapAt(textCenter);
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(lookedUp, isNull);
+
+    final lookUp = find.text('Look up');
+    expect(lookUp, findsOneWidget);
+    await tester.tap(lookUp);
+    await tester.pumpAndSettle();
+
+    expect(lookedUp, equals('Hello'));
+  });
+
+  testWidgets('selection toolbar debounces during drag selection', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: true,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: true,
+          onLookupRequested: (_) {},
+          onTap: () {},
+        ),
+      ),
+    );
+
+    final textFinder = find.text('Hello world');
+    final from = tester.getTopLeft(textFinder) + const Offset(30, 10);
+    final gesture = await tester.startGesture(from);
+    await tester.pump(const Duration(milliseconds: 600));
+    await gesture.moveBy(const Offset(60, 0));
+    await tester.pump(const Duration(milliseconds: 50));
+    await gesture.moveBy(const Offset(40, 0));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.text('Look up'), findsNothing);
+
+    await gesture.up();
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.pump();
+
+    expect(find.text('Look up'), findsOneWidget);
+  });
+
+  testWidgets('shows recording badge when recordingCount is positive', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: false,
+          recordingCount: 2,
+          onTap: () {},
+        ),
+      ),
+    );
+
+    final tokens = EnjoyThemeTokens.of(
+      tester.element(find.byType(TranscriptLineTile)),
+    );
+    expect(find.byIcon(EnjoyIcons.mic), findsNothing);
+    expect(
+      find.byWidgetPredicate(
+        (w) =>
+            w is Container &&
+            w.constraints?.maxWidth == 6 &&
+            (w.decoration as BoxDecoration?)?.color == tokens.you,
+      ),
+      findsOneWidget,
+      reason: 'the practiced dot rides the timestamp gutter in you',
+    );
+  });
+
+  testWidgets('hides recording badge when recordingCount is zero', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: false,
+          recordingCount: 0,
+          onTap: () {},
+        ),
+      ),
+    );
+
+    expect(find.byIcon(EnjoyIcons.mic), findsNothing);
+  });
+
+  testWidgets('hides recording badge while recordingCount is loading', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      transcriptTileHarness(
+        TranscriptLineTile(
+          line: const TranscriptLine(
+            text: 'Hello world',
+            startMs: 0,
+            durationMs: 2000,
+          ),
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          groupedInEcho: false,
+          selectable: false,
+          onTap: () {},
+        ),
+      ),
+    );
+
+    expect(find.byIcon(EnjoyIcons.mic), findsNothing);
+  });
+
+  testWidgets('active line stays flat on the ground without a plate', (
+    tester,
+  ) async {
+    for (final brightness in [Brightness.light, Brightness.dark]) {
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            transcriptBlurModeProvider.overrideWith(() => _BlurMode(false)),
+            karaokeHighlightSettingsProvider.overrideWith(
+              _KaraokeHighlightOff.new,
+            ),
+            ...transcriptWordPracticeOffOverrides(),
+          ],
+          child: MaterialApp(
+            theme: buildAppTheme(brightness),
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Scaffold(
+              body: TranscriptLineTile(
+                line: const TranscriptLine(
+                  text: 'Hello world',
+                  startMs: 0,
+                  durationMs: 2000,
+                ),
+                mediaId: 'test',
+                secondaryText: null,
+                isActive: true,
+                inEcho: false,
+                groupedInEcho: false,
+                selectable: false,
+                onTap: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      final tokens = EnjoyThemeTokens.of(
+        tester.element(find.byType(TranscriptLineTile)),
+      );
+      final boxes = tester.widgetList<DecoratedBox>(
+        find.descendant(
+          of: find.byType(TranscriptLineTile),
+          matching: find.byType(DecoratedBox),
+        ),
+      );
+      expect(
+        boxes.any(
+          (b) => (b.decoration as ShapeDecoration?)?.color == tokens.accentSoft,
+        ),
+        isFalse,
+        reason: 'no active plate in $brightness — the Duet lens is flat',
+      );
+      expect(find.text('0:00'), findsOneWidget);
+    }
+  });
+}

@@ -1,0 +1,154 @@
+name: Release Android
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      build_apk:
+        description: Also build per-ABI release APKs (sideload)
+        type: boolean
+        default: true
+      upload_play:
+        description: Upload store AAB to Google Play (alpha track, draft)
+        type: boolean
+        default: true
+      publish:
+        description: Upload sideload APKs + update feeds on dl.enjoy.bot
+        type: boolean
+        default: false
+      publish_github:
+        description: Upload binaries to the GitHub Release for this tag (draft; finalize via release_publish.yml)
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-android-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Android release
+    runs-on: [self-hosted, Linux]
+    env:
+      ANDROID_USE_RUNNER_KEYSTORE: ${{ vars.ANDROID_USE_RUNNER_KEYSTORE || 'false' }}
+      # This runner sits behind a network where dl.google.com resets the TLS
+      # handshake, so Gradle resolves Google Maven artifacts through the
+      # Aliyun mirror (see android/settings.gradle.kts).
+      ENABLE_MAVEN_MIRROR: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Ensure Linux tooling
+        run: bash .github/scripts/ensure_linux_tooling.sh --skip-wpe
+
+      - uses: ./.github/actions/setup-java
+
+      - uses: ./.github/actions/setup-flutter
+
+      - uses: ./.github/actions/setup-android
+        with:
+          packages: >-
+            platforms;android-36
+            build-tools;36.0.0
+
+      - name: Point Flutter at Android SDK
+        run: |
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$sdk" ]; then echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME not set"; exit 1; fi
+          flutter config --android-sdk "$sdk"
+
+      - name: Build Android release
+        env:
+          # Forwarded to flutter build as --dart-define (analytics_config.dart).
+          # Unset ⇒ binary ships analytics-inert.
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # Base64 avoids GHA multiline env mangling of the SA private_key.
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_BASE64 }}
+          # Tag pushes have no workflow inputs (null). Treat null/true as build;
+          # only workflow_dispatch with build_apk=false skips sideload APKs.
+          # `inputs.build_apk != false` is wrong here: GitHub coerces null to
+          # false, so a tag push resolved to "false", passed --no-apk, and the
+          # publish step then failed on the missing APKs.
+          INPUT_BUILD_APK: ${{ inputs.build_apk == null && 'true' || inputs.build_apk }}
+          # Same for Play: tag pushes and default-true manual runs upload the AAB.
+          INPUT_UPLOAD_PLAY: ${{ inputs.upload_play == null && 'true' || inputs.upload_play }}
+        run: |
+          args=()
+          # Only skip when explicitly false (empty/null must still build).
+          if [[ "${INPUT_BUILD_APK}" == "false" ]]; then
+            args+=(--no-apk)
+          fi
+          if [[ "${INPUT_UPLOAD_PLAY}" == "true" ]]; then
+            args+=(--play)
+          fi
+          bash .github/scripts/release_android.sh "${args[@]}"
+
+      - name: Publish sideload feeds
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL_S3: ${{ secrets.AWS_ENDPOINT_URL_S3 }}
+          PUBLISH_BUCKET: ${{ secrets.PUBLISH_BUCKET }}
+          PUBLISH_PREFIX: player
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          RELEASE_REQUIRE_S3: "1"
+        run: |
+          bash .github/scripts/ensure_publish_tooling.sh
+          bash .github/scripts/release_android.sh --publish-only --publish
+
+      - name: Upload binaries to GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Enjoy Player ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            build/app/outputs/bundle/release/EnjoyPlayer-v*.aab
+            build/app/outputs/flutter-apk/EnjoyPlayer-v*-arm64-v8a.apk
+            build/app/outputs/flutter-apk/EnjoyPlayer-v*-armeabi-v7a.apk
+            build/app/outputs/flutter-apk/EnjoyPlayer-v*-x86_64.apk
+
+      - name: Read pubspec version
+        id: read_version
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_github
+        shell: bash
+        run: echo "version=$(bash .github/scripts/read_pubspec_version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binaries to GitHub Release (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_github
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.read_version.outputs.version }}
+          name: Enjoy Player v${{ steps.read_version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            build/app/outputs/bundle/release/EnjoyPlayer-v*.aab
+            build/app/outputs/flutter-apk/EnjoyPlayer-v*-arm64-v8a.apk
+            build/app/outputs/flutter-apk/EnjoyPlayer-v*-armeabi-v7a.apk
+            build/app/outputs/flutter-apk/EnjoyPlayer-v*-x86_64.apk
+
+      - name: Clean up signing files
+        if: always() && env.ANDROID_USE_RUNNER_KEYSTORE != 'true'
+        run: rm -f android/key.properties android/ci-release-keystore.jks

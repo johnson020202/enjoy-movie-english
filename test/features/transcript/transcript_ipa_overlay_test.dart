@@ -1,0 +1,299 @@
+import 'package:enjoy_player/core/interaction/enjoy_pressable.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:enjoy_player/core/theme/colors.dart';
+import 'package:enjoy_player/data/subtitle/ipa_mapping.dart';
+import 'package:enjoy_player/data/subtitle/transcript_line.dart';
+import 'package:enjoy_player/features/settings/application/karaoke_highlight_settings.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_blur_mode_provider.dart';
+import 'package:enjoy_player/features/transcript/presentation/transcript_line_tile.dart';
+import 'package:enjoy_player/features/transcript/presentation/transcript_markup.dart';
+import 'package:enjoy_player/features/transcript/presentation/transcript_word_ipa_layer.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+import '../../helpers/transcript_settings_overrides.dart';
+
+class _KaraokeOff extends KaraokeHighlightSettings {
+  @override
+  Future<bool> build() async => false;
+}
+
+class _BlurMode extends TranscriptBlurMode {
+  _BlurMode(this._initial);
+  final bool _initial;
+
+  @override
+  bool build() => _initial;
+}
+
+const _nested = TranscriptLine(
+  text: 'Hello world',
+  startMs: 0,
+  durationMs: 2000,
+  timeline: [
+    TranscriptWord(
+      text: 'Hello',
+      startMs: 0,
+      durationMs: 800,
+      phones: [
+        TranscriptPhone(
+          phone: 'hɛˈloʊ',
+          text: 'hɛˈloʊ',
+          startTime: 0,
+          endTime: 0.4,
+        ),
+      ],
+    ),
+    TranscriptWord(text: 'world', startMs: 800, durationMs: 800),
+  ],
+);
+
+const _mixedEmptyPhones = TranscriptLine(
+  text: 'Hello world',
+  startMs: 0,
+  durationMs: 2000,
+  timeline: [
+    TranscriptWord(
+      text: 'Hello',
+      startMs: 0,
+      durationMs: 800,
+      phones: [
+        TranscriptPhone(phone: '   ', text: '', startTime: 0, endTime: 0.4),
+      ],
+    ),
+    TranscriptWord(
+      text: 'world',
+      startMs: 800,
+      durationMs: 800,
+      phones: [
+        TranscriptPhone(
+          phone: 'wɝld',
+          text: 'wɝld',
+          startTime: 0.8,
+          endTime: 1.2,
+        ),
+      ],
+    ),
+  ],
+);
+
+const _untimedIpa = TranscriptLine(
+  text: 'Hello world',
+  startMs: 0,
+  durationMs: 2000,
+  timeline: [
+    TranscriptWord(
+      text: 'Hello',
+      phones: [TranscriptPhone(phone: 'hɛˈloʊ', text: 'hɛˈloʊ')],
+    ),
+    TranscriptWord(
+      text: 'world',
+      phones: [TranscriptPhone(phone: 'wɝld', text: 'wɝld')],
+    ),
+  ],
+);
+
+const _lineOnly = TranscriptLine(
+  text: 'Hello world',
+  startMs: 0,
+  durationMs: 2000,
+);
+
+Widget _harness({
+  required Widget child,
+  List<Override> extraOverrides = const [],
+}) {
+  return ProviderScope(
+    overrides: [
+      transcriptBlurModeProvider.overrideWith(() => _BlurMode(false)),
+      karaokeHighlightSettingsProvider.overrideWith(_KaraokeOff.new),
+      ...extraOverrides,
+    ],
+    child: MaterialApp(
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: Scaffold(body: child),
+    ),
+  );
+}
+
+void main() {
+  final helloIpa = formatPhonesAsFamiliarIpa(['hɛˈloʊ']);
+  final worldIpa = formatPhonesAsFamiliarIpa(['wɝld']);
+
+  testWidgets(
+    'overlay on shows stacked IPA; lookup and line taps stay orthography',
+    (tester) async {
+      var taps = 0;
+      String? lookedUp;
+      await tester.pumpWidget(
+        _harness(
+          extraOverrides: transcriptIpaOverlayOnOverrides(),
+          child: Column(
+            children: [
+              TranscriptLineTile(
+                line: _nested,
+                mediaId: 'test',
+                secondaryText: '你好世界',
+                isActive: false,
+                inEcho: false,
+                selectable: false,
+                onTap: () => taps++,
+              ),
+              TranscriptLineTile(
+                line: _nested,
+                mediaId: 'test',
+                secondaryText: null,
+                isActive: true,
+                inEcho: false,
+                selectable: true,
+                onLookupRequested: (t) => lookedUp = t,
+                onTap: () => taps++,
+              ),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(TranscriptAlignedWords), findsWidgets);
+      expect(find.text(helloIpa), findsWidgets);
+      expect(find.text('Hello'), findsWidgets);
+      expect(find.byType(Chip), findsNothing);
+
+      final ipaText = tester.widget<Text>(find.text(helloIpa).first);
+      expect(ipaText.style?.color, AppColors.ink3Light);
+
+      await tester.tap(find.byType(EnjoyPressable).first);
+      expect(taps, 1);
+
+      expect(lookedUp, isNull);
+      expect(transcriptPlainForSelection(_nested.text), 'Hello world');
+    },
+  );
+
+  testWidgets('line-only cue has no IPA widgets when overlay is on', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        extraOverrides: transcriptIpaOverlayOnOverrides(),
+        child: TranscriptLineTile(
+          line: _lineOnly,
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          selectable: false,
+          onTap: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Hello world'), findsOneWidget);
+    expect(find.byType(TranscriptAlignedWords), findsNothing);
+    expect(find.text(helloIpa), findsNothing);
+  });
+
+  testWidgets('unreadable phones skip that word and do not blank the line', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        extraOverrides: transcriptIpaOverlayOnOverrides(),
+        child: TranscriptLineTile(
+          line: _mixedEmptyPhones,
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          selectable: false,
+          onTap: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Hello'), findsOneWidget);
+    expect(find.text('world'), findsOneWidget);
+    expect(find.text(worldIpa), findsOneWidget);
+    expect(find.byType(Chip), findsNothing);
+  });
+
+  testWidgets(
+    'untimed IPA labels still render; missing word windows do not seek',
+    (tester) async {
+      await tester.pumpWidget(
+        _harness(
+          extraOverrides: transcriptIpaOverlayOnOverrides(),
+          child: TranscriptLineTile(
+            line: _untimedIpa,
+            mediaId: 'test',
+            secondaryText: null,
+            isActive: false,
+            inEcho: false,
+            selectable: false,
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(TranscriptAlignedWords), findsOneWidget);
+      expect(find.text(helloIpa), findsOneWidget);
+      expect(find.text(worldIpa), findsOneWidget);
+    },
+  );
+
+  testWidgets('IPA labels start at their word instead of centring under it', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        extraOverrides: transcriptIpaOverlayOnOverrides(),
+        child: TranscriptLineTile(
+          line: _untimedIpa,
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: true,
+          inEcho: false,
+          selectable: false,
+          onTap: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    for (final (word, ipa) in [('Hello', helloIpa), ('world', worldIpa)]) {
+      final wordLeft = tester.getTopLeft(find.text(word)).dx;
+      final ipaLeft = tester.getTopLeft(find.text(ipa)).dx;
+      expect(ipaLeft - wordLeft, moreOrLessEquals(1, epsilon: 0.01));
+    }
+  });
+
+  testWidgets('echo lens rows drop the IPA overlay', (tester) async {
+    await tester.pumpWidget(
+      _harness(
+        extraOverrides: transcriptIpaOverlayOnOverrides(),
+        child: TranscriptLineTile(
+          line: _untimedIpa,
+          mediaId: 'test',
+          secondaryText: null,
+          isActive: false,
+          inEcho: false,
+          selectable: false,
+          lensDistance: 1,
+          onTap: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(TranscriptAlignedWords), findsNothing);
+    expect(find.text(helloIpa), findsNothing);
+  });
+}

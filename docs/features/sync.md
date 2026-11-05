@@ -1,0 +1,101 @@
+# Sync (cloud metadata)
+
+## Scope
+
+**Local-first** metadata sync for **audio**, **video**, and **recording** rows:
+
+- **Upload**: `POST /api/v1/mine/audios|videos|recordings` with JSON metadata only (no file blobs).
+- **Outbound queue**: Drift table `sync_queue` (`entityType`, `entityId`, `action`, optional `payloadJson`, retries). `peekBatch`'s `ORDER BY created_at` drain is served by `idx_sync_queue_created_at` (schema v20, issue #827 C3) — the pre-existing `(retry_count, created_at)` index cannot order a created_at-only scan. Payload rows with `kind: youtube_upload` (entity `video`, enqueued by failed YouTube worker transcript uploads) are consumed by the worker transcripts API, not the cloud `/api/v1/mine` uploads — see [ADR-0049](../decisions/0049-youtube-language-aware-captions.md).
+- **No automatic library mirror**: signing in does **not** download every remote audio/video/recording into the Library. Remote browsing is opt-in via the [Cloud](cloud.md) screen.
+
+### Vocabulary (items + contexts) — auto-pull exception
+
+[ADR-0054](../decisions/0054-vocabulary-cloud-sync.md) extends the entities above with **vocabulary items** and **vocabulary contexts** (`SyncEntityType.vocabularyItem` / `.vocabularyContext`, wire `vocabulary_item` / `vocabulary_context`):
+
+- **Upload**: `POST /api/v1/mine/vocabulary_items|vocabulary_contexts` via [`VocabularyApi`](../../lib/data/api/services/vocabulary_api.dart), same envelope shape as audio/video (`{ vocabularyItem: {…} }` / `{ vocabularyContext: {…} }`).
+
+**Explanation / locator wire shape:** the server stores `explanation` (items + contexts) and `locator` (contexts) as `jsonb NOT NULL DEFAULT '{}'` — on the wire they are **JSON objects**, never strings. Rows store them locally as JSON text; [`sync_serializers`](../../lib/features/sync/data/sync_serializers.dart) decodes text → object on upload and re-encodes object → text on pull (`jsonValueFromText` / `jsonTextFromWire`). A pull payload whose `explanation` is an object (the only shape the server emits) must still land as JSON text — the historical `as String?` cast dropped every server row.
+
+**Cursor invariant:** each page is validated by a pure merge phase (`mergePageRows`) before anything is written (`persistMergedRows`); the entity's `updatedAfter` cursor advances only when every row in the page applied cleanly, and a page with failures stops that entity's pull so the next sync re-fetches the same window (valid rows still persist — upserts are idempotent). (Historically the cursor advanced past rows that failed to merge — with the `explanation` cast bug above that poisoned every install's vocabulary cursor while the local word book stayed empty. `SyncDownloadService._repairVocabularyCursorsOnce` clears both vocabulary cursors exactly once per user — check + deletes + flag in one DB transaction, so "flag set ⇒ cursors cleared" is a single observable state — flag `sync.repair.vocab_cursor_dropped_rows.v1` — so upgraded installs re-pull the full server word book.)
+- **Auto-pull on every signed-in `fullSync`** — unlike audio/video/recording above, vocabulary **is** mirrored automatically (paged by `updatedAfter` cursors `sync.cursor.vocabulary_item` / `sync.cursor.vocabulary_context`). This is a deliberate, narrow exception to the no-auto-mirror policy: a word book is a cross-device dataset, not local-path media.
+- **Item conflict is SRS-preserving**, not plain last-write-wins: [`resolveVocabularyItemConflict`](../../lib/features/vocabulary/domain/vocabulary_item_conflict.dart) keeps whichever side's spaced-repetition activity (`lastReviewedAt`, else `reviewsCount`) is fresher, and only adopts the other side's `word` / `explanation` when that side's `updatedAt` is newer than the SRS-winning side's review reference. **Context conflict** stays plain LWW on `updatedAt` (server wins ties).
+- **Review audits (`vocabulary_reviews`) never sync** — never uploaded, never downloaded, never enqueued. Undo history is per-device only.
+- Enqueued from [`VocabularyRepository`](../../lib/features/vocabulary/data/vocabulary_repository.dart): item/context `create` on `addWithContext`, item `update` on `markReviewed` / `undoLatestReview` / explanation write-through / context-count bump, item `delete` after the local cascade (contexts + reviews) on `deleteItem`.
+
+**Recording metadata** on the wire (`duration`, `referenceStart`, `referenceDuration`) uses **milliseconds**, matching the enjoy web/extension `Recording` type. The local Drift `recordings` row uses the same Dart field names (`duration`, `referenceStart`, `referenceDuration`); SQLite columns are `duration`, `reference_start`, `reference_duration`. Audio and video rows still use **seconds** for `duration` in their payloads.
+
+### Lazy recording pull
+
+When the user opens a media item in the player **while signed in**, the app pulls **recording metadata only** for that `(targetType, targetId)` from `GET /api/v1/mine/recordings` (paged with `updatedAfter`). Cursors live under `settings_kv` as `sync.cursor.recording.{TargetType}.{targetId}`. This replaces the old global “download all recordings” pass on sign-in. Both the full download service and the lazy recording pull run through the shared paged cursor download engine (`downloadPagedEntities` + `mergeAndUpsertPage` in [`sync_page_upsert.dart`](../../lib/features/sync/data/sync_page_upsert.dart), issues #827 B3, #1222), following the same **cursor invariant** as the download path above: the per-target cursor advances only when every row in the page applied cleanly, and a failed page stops the pull so the next media-open re-fetches the same window.
+
+### Import IDs (web parity)
+
+Local file fingerprints use the same **partial SHA-256** strategy as the Enjoy web `hashBlob` helper in `apps/web/src/db/id-generator.ts` (first / middle / last 4 MiB). Imports require a signed-in session (ADR-0031); there is no signed-out import or re-key path.
+
+- **Audio** (user-scoped): `aid = SHA-256(contentHash + ":" + userId)`, `id = uuid_v5(audio:user:{aid})` — matching `generateLocalAudioAid` on web.
+- **Video** (content-addressed, [ADR-0056](../decisions/0056-uservideo-library-membership.md)): `vid = contentHash` (no `userId` salt), `id = uuid_v5(video:user:{vid})`. Legacy per-user video upload ids on the server are left as-is.
+
+## Sync status (Settings)
+
+**Settings → Cloud sync → Sync status** opens a screen that:
+
+- Streams live counts from the local `sync_queue` table (**waiting to upload** vs **failed permanently** after hitting the [`SyncRetryPolicy`](../../lib/features/sync/domain/sync_retry_policy.dart) threshold).
+- Shows **last successful full sync** time (stored in settings KV as `sync.last_full_sync_at` after a successful `fullSync`).
+- Offers **Sync now** (queue processing only) and **Retry failed items** (resets exhausted rows then runs `fullSync`).
+
+When signed out, the sync screen explains that sign-in is required and links to the sign-in flow.
+
+## Triggers
+
+- Signing in schedules [`SyncEngine.fullSync`](../../lib/features/sync/application/sync_engine.dart) via [`SyncCtrl`](../../lib/features/sync/application/sync_controller.dart) on the **first frame after** auth transitions to signed-in (`addPostFrameCallback`).
+- While signed in, queue drain repeats on a **5-minute** timer — gated on the app being in the foreground (issue #810 G, same `WidgetsBinding.lifecycleState` check as the Discover refresh scheduler: ticks while paused/inactive are skipped instead of burning battery in the background) — and every enqueue through the [typed seam](#typed-enqueue-seam-issues-718--749) also schedules an **immediate** drain (the signed-in `scheduleSyncQueueDrain` tail), so freshly enqueued work starts without waiting for the timer (issue #749).
+- Library import/delete and shadow-reading recording save/delete call [`syncEnqueueProvider`](../../lib/features/sync/application/sync_providers.dart); the transcript repository's durable YouTube worker-upload retry calls [`syncEnqueueJobProvider`](../../lib/features/sync/application/sync_providers.dart) (see below).
+
+## Retry policy (issue #752)
+
+Every "permanently failed" decision derives from one module — [`SyncRetryPolicy`](../../lib/features/sync/domain/sync_retry_policy.dart):
+
+- **Threshold**: a row is permanently failed once `retryCount >= maxRetries` (behavior-preserving default: **5 attempts**). The value written by `SyncQueueDao.markPermanentlyFailed` is `policy.maxRetries`, received as the DAO's `retryLimit` method parameter so `lib/data/db` never imports `lib/features`.
+- **Backoff**: `baseDelayMs × 2^retryCount` (behavior-preserving default base: **1000 ms**) measured against an injectable wall clock (`DateTime Function()`), so tests pin time deterministically instead of sleeping past real windows (same seam as `YouTubePlayRetryPolicy`).
+- **Consumers**: the drain's backoff filter in `SyncEngine._drainOnce` (via `backoffElapsed`), `SyncQueueRepository.pendingItems` / `watchSnapshot` / `resetFailed` (both the Dart predicate and the SQL clauses derive from the policy via `isPermanentlyFailed` / `permanentlyFailed` / `eligible`), and the DAO `retryLimit` all read the same policy. `shouldRetry` composes the threshold and backoff halves and is pinned by unit test but has no in-tree caller — the drain path applies the threshold exactly once (in `pendingItems` SQL) plus the in-memory backoff filter, so there is no second threshold check.
+
+## Typed enqueue seam (issues #718, #749)
+
+`sync_queue` is a cross-module protocol with one typed enqueue surface: [`SyncQueueJob`](../../lib/features/sync/domain/sync_queue_job.dart) in the sync domain layer. Producers construct typed variants (`SyncAudioUpsert`, `SyncVocabularyItemDelete`, `SyncYoutubeUploadRetry`, …) — never hand-rolled `entityType` / `entityId` / `action` / `payloadJson` strings — and persist them through the widened seam (issue #749), which has two entries sharing one tail:
+
+- [`syncEnqueueProvider`](../../lib/features/sync/application/sync_providers.dart) — the existing `(type, id, action)` form. It builds the typed job per entity via `SyncQueueJob.deleteFor` / `SyncQueueJob.snapshotUpsert` (reads the live row, flips `syncStatus` to `pending`); this is the form craft, library, shadow_reading, and vocabulary use, unchanged.
+- [`syncEnqueueJobProvider`](../../lib/features/sync/application/sync_providers.dart) — the job-shaped entry (`SyncEnqueueJobFn`) for variants whose payload **is** the job: there is no local row to re-read, so the producer builds the variant itself. The transcript repository hands it `SyncYoutubeUploadRetry` when a worker upload fails (issue #749). It is a manual provider (same "avoids extra codegen" precedent as `cloud_providers.dart`) so the generated `syncEnqueueProvider` surface stays untouched.
+
+Both entries run `SyncQueueRepository.addJob` — the dedup contract on `(entityType, entityId, action)` plus failed-state preservation — and then, **when signed in**, `scheduleSyncQueueDrain`, so the queue starts draining immediately instead of waiting for `SyncCtrl`'s 5-minute timer (the timer remains the quiet-app fallback). Feature code no longer constructs `SyncQueueRepository(...)` directly; the repository is built only by `syncQueueRepositoryProvider` (issue #749).
+
+[`SyncEngine._processOne`](../../lib/features/sync/application/sync_engine.dart) decodes the row via `SyncQueueJob.decode` and switches exhaustively over the variant, so adding a producer without matching consumer handling is a compile error instead of a silent row drop; that switch stays the **only** variant consumer — the `SyncYoutubeUploadRetry` retry-handling contract (throw-on-false + encode-derived conditional remove) lives on the job module as [`SyncYoutubeUploadRetry.processRetry`](../../lib/features/sync/domain/sync_queue_job/youtube_upload_retry.dart), whose expected race-guard payload comes from `job.encode().payloadJson` (encode stability is documented on `SyncQueueJob.encode` and pinned by test). The `youtube_upload` worker retry rides the `video` entity (`action: update`, `payload.kind: youtube_upload`) and decodes via the video variant — no `SyncEntityType` value for the worker upload (web/Dexie wire parity pins the enum). `SyncQueueRepository.addOrUpsert` stays `@visibleForTesting` for the seam test and the failed-state-preservation contract tests.
+
+## Conflict policy
+
+Server wins when `server.updatedAt >= local.updatedAt`; local-only paths (`localUri`, `localPath`) are preserved on merge.
+
+Download (`SyncDownloadService`) applies that merge **per page**, not per row (issue #810 D3): each 50-row page costs one `WHERE id IN (…)` pre-read of existing local rows (DAO `getManyByIds`) plus one transactional batch upsert (DAO `upsertRows`) instead of two database round trips and one commit per row. If the bulk read or the batch fails, the page falls back to the historical per-row `getById` / merge / `insertRow` path so a single bad row still cannot fail its page neighbors; the merge callbacks themselves are unchanged. The page merge/upsert + fallback logic lives in [`sync_page_upsert.dart`](../../lib/features/sync/data/sync_page_upsert.dart) (`mergeAndUpsertPage`) and is shared with the lazy recording pull (issue #827 B3).
+
+When the server accepts an upload but **omits** the `updatedAt` field in its response, [`SyncUploadService`](../../lib/features/sync/data/sync_upload_service.dart) throws a `SyncMissingUpdatedAtError` instead of silently stamping the row with `DateTime.now()`. The local `serverUpdatedAt` is preserved as-is and the queue row is marked for a follow-up pull — this prevents a clock-skewed "successful" upload from masking a real divergence on the next reconciliation. Callers should treat `SyncMissingUpdatedAtError` as a soft failure (retry eligible) rather than a hard conflict.
+
+**Vocabulary exception:** older `POST /mine/vocabulary_items|vocabulary_contexts` responses were only `{ success: true }` (`len=16`). The client refetches `GET …/:id` when the create body lacks `updatedAt`. The API should return the persisted row via `render :show` (same shape as GET show).
+
+### Library membership (UserVideo)
+
+Mine video APIs mean **library membership**, not exclusive ownership of the catalog `Video` row ([ADR-0056](../decisions/0056-uservideo-library-membership.md)). Many users can enroll the same YouTube/Netflix (or new content-addressed upload) id. `DELETE /mine/videos/:id` leaves the library (soft-deletes membership); pulls may include `deletedAt` tombstones — the player removes the local row.
+
+New local uploads use **content-addressed** ids: `vid = contentHash` (no `userId`), `id = uuid_v5(video:user:{vid})`. Legacy per-user upload ids on the server are left as-is.
+
+### Duplicate create recovery
+
+On rare unique races during `POST /mine/{videos,audios,vocabulary_items,vocabulary_contexts}`, the client retries with the matching `GET …/:id`. If that 404s, sync marks the queue item permanently failed (`SyncDuplicateMissingError`). Recordings deliberately have no duplicate-recovery path — the duplicate propagates to the sync engine. Public catalog GET is no longer used for ownership recovery.
+
+## Related
+
+- [ADR-0010](../decisions/0010-cloud-sync-mvp.md) (historical bidirectional download scope)
+- [ADR-0013](../decisions/0013-local-first-sync.md) (local-first + lazy recordings)
+- [ADR-0054](../decisions/0054-vocabulary-cloud-sync.md) (vocabulary items/contexts, SRS-preserving conflict, auto-pull exception)
+- [ADR-0056](../decisions/0056-uservideo-library-membership.md) (UserVideo library membership + content-addressed video uploads)
+- [Cloud index](cloud.md)
+- [Vocabulary](vocabulary.md)
+- Web reference: `enjoy` monorepo `apps/web/src/db/services/sync-*.ts`, `apps/web/src/db/id-generator.ts`

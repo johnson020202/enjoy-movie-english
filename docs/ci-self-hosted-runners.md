@@ -1,0 +1,226 @@
+# Self-hosted CI runners
+
+All GitHub Actions workflows in this repo run on **self-hosted** runners, in two groups — the one exception being [release_publish.yml](../.github/workflows/release_publish.yml), which finalizes GitHub Release drafts from GitHub-hosted `ubuntu-latest`. The Linux jobs run in the gh-sr **container** pool; there dependency caches go through **`actions/cache`** — served by the LAN **`gh-sr-cache`** server rather than GitHub's storage, so restores cost no proxy bytes (see [ADR-0097](decisions/0097-ci-dependency-cache-and-cn-mirrors.md)). The macOS and Windows jobs run on **native** runners, whose filesystem persists between jobs; their dependency caches live on local disk and they use no `actions/cache` at all (see [ADR-0099](decisions/0099-native-runner-dependency-cache.md)). Build outputs are **not** uploaded as cache; release binaries go to **dl.enjoy.bot** (S3/R2) when publish is enabled, or remain on the runner workspace until the job ends.
+
+The earlier rule — *never* use `actions/cache`, because dependencies persist on the runner's disk between jobs — is correct for exactly one of those groups. Gh-sr **container** jobs get their inner environment reset to a pristine state before every run (only the image cache survives), so `~/.pub-cache`, `~/.gradle` and the CocoaPods stores do **not** persist and must be restored with `actions/cache`; only installs under `RUNNER_TOOL_CACHE` / `~/.local/share/mise` survive. **Native** jobs (macOS, Windows) run directly as the host user with no reset, so `$HOME` / `%USERPROFILE%` does persist: `~/.pub-cache`, `~/.cocoapods`, `~/Library/Caches/CocoaPods` and `%LOCALAPPDATA%\Pub\Cache` carry over between jobs, and their workflows deliberately cache nothing (a GitHub-cache restore round-trip through the WAN proxy cost more in time and traffic than the disk read it replaced).
+
+Runners are managed via **[`gh-sr`](https://github.com/an-lee/gh-sr)** (`~/.gh-sr/runners.yml` on the control machine), except where noted. See that repo's docs for `hosts` / `runners` / `container_runner_image` schema.
+
+Shared workflow pieces:
+
+| Path | Purpose |
+|------|---------|
+| [`.github/actions/setup-flutter`](../.github/actions/setup-flutter) | Install/pin Flutter from the `flutter` entry in [`mise.toml`](../mise.toml). Installs into a persistent, version-keyed directory on the runner's local disk and **skips the download entirely** when that version is already present — no `subosito/flutter-action` cache, and no Actions cache for the SDK itself (it lands in `RUNNER_TOOL_CACHE`, which survives the container per-job reset and persists on the native runners). Reinstalls if the cached tree is missing `bin/flutter` or a working `.git` (required by `flutter --version`). Honors `FLUTTER_STORAGE_BASE_URL` when it does download. |
+| [mise](https://mise.jdx.dev) in [ci.yml](../.github/workflows/ci.yml) | Pilot: [ci.yml](../.github/workflows/ci.yml) installs the same mise.toml pin via `jdx/mise-action` instead of `setup-flutter`. Installs persist under `~/.local/share/mise` on the runner. The **agentic workflows** (`repo-assist` and friends) also install Flutter through `jdx/mise-action` now — see *Agentic workflows* below. If the pilot proves out, the remaining deterministic workflows migrate off `setup-flutter`. |
+| [`.github/actions/setup-android`](../.github/actions/setup-android) | Install Android cmdline-tools + SDK packages with the flaky runner network in mind. The **mirror path runs first**: a missing `sdkmanager` is bootstrapped from the Tencent mirror zip (`sdk_mirror_base_url`, default `https://mirrors.cloud.tencent.com/AndroidSDK/`) and `sdkmanager` downloads go through `SDK_TEST_BASE_URL` — on this pool `dl.google.com` TLS-resets on a direct route. `android-actions/setup-android` (dl.google.com) is demoted to last-resort fallback, and only runs after the mirror path fails, so a proxy that un-blocks Google cannot win by default and burn proxy quota. Installs are retried with backoff and skipped entirely once the requested packages persist on the runner. |
+| [`.github/actions/setup-macos-runner-env`](../.github/actions/setup-macos-runner-env) | Homebrew PATH, UTF-8 locale, curl HTTP/1.1, `GIT_CONFIG_COUNT=0` (SwiftPM-safe) |
+| [`.github/scripts/apple_spm_hygiene.sh`](../.github/scripts/apple_spm_hygiene.sh) | Host lock + SPM cache clear + retry helpers for Apple CI/release |
+| [`tool/prefetch_flutter_engine_android_libs.sh`](../tool/prefetch_flutter_engine_android_libs.sh) | Prefetch the Flutter engine Android artifacts (`io.flutter:*` — the embedding plus one `libflutter.so` jar per ABI, ~520 MB) into `build/flutter-engine-maven/`, a local Maven repository that `android/build.gradle.kts` lists first, so Gradle resolves them from disk. Gradle downloads them without a retry and the China mirror resets the TLS handshake in bursts, which fails the whole build. The fetch retries, resumes a truncated transfer via `Range`, and falls back to the upstream bucket. See [ADR-0101](decisions/0101-flutter-engine-artifact-prefetch.md). |
+| [`.github/scripts/ensure_linux_tooling.sh`](../.github/scripts/ensure_linux_tooling.sh) | Install apt packages only when missing. On the shared gh-sr agentic pool these are now normally baked into the container image (see below), so this is usually a fast no-op. Jobs that never compile the Linux desktop app (CI analyze/test, Android smoke + release) pass `--skip-wpe` to skip the WPE WebKit prefix from deb.debian.org; the Linux build/release jobs still fetch it (with retries, extracted atomically so a failed fetch cannot leave a half-populated prefix). |
+| `AZURE_SPEECH_SDK_CACHE` | Build Windows points the `azure_speech` plugin CMake at `RUNNER_TOOL_CACHE\azure-speech-sdk\` so the Speech SDK NuGet package (~28 s download) is fetched once per version instead of every clean build. The CMake download retries and only marks the SDK extracted once its headers exist. |
+| [`windows/scripts/fetch_ffmpeg.ps1`](../windows/scripts/fetch_ffmpeg.ps1) | Build Windows fetches FFmpeg into `RUNNER_TOOL_CACHE\ffmpeg-release-essentials\` (persists on the native runner) and copies it into the staged workspace, instead of re-downloading ~100 MB from gyan.dev each run. Downloads retry with backoff. |
+| [`.github/scripts/ensure_nuget_feed.ps1`](../.github/scripts/ensure_nuget_feed.ps1) | Ensure NuGet.org feed on Windows |
+| [`.github/workflows/shared/`](../.github/workflows/shared/) + each workflow's own `pre-agent` steps | The shared step files (`engine-*.md`, `formatting.md`, `github-app.md`, `mcp.md`, `reporting.md`) carry the per-engine setup. The **Flutter pre-agent setup now lives in each agentic workflow's own `.md`** (e.g. `repo-assist.md`): `ensure_linux_tooling.sh` → `jdx/mise-action` (installs the `mise.toml` pin) → `flutter --version` → `flutter pub get`. There is no `shared/runtime.md` any more. |
+
+When you bump Flutter in `mise.toml`, the next workflow run downloads that version once per runner/host and reuses it from local disk afterward.
+
+---
+
+## Dependency caching and mirrors
+
+The pool sits behind a per-GB proxy (~55 GB/day of WAN traffic measured). Three mechanisms keep dependency downloads off it — see [ADR-0097](decisions/0097-ci-dependency-cache-and-cn-mirrors.md) for the reasoning:
+
+1. **`actions/cache` for dependency stores — container pool only.** Restore is served from the LAN `gh-sr-cache` server: zero proxy bytes. The four container-pool workflows (`ci`, `codegen_drift`, `build_linux`, `android_apk_smoke`) cache `~/.pub-cache`; `android_apk_smoke` also caches `~/.gradle/wrapper/dists` + `~/.gradle/caches/modules-2`. The native `build_apple` and `build_windows` jobs cache nothing: their pub and CocoaPods stores already persist on the runner disk ([ADR-0099](decisions/0099-native-runner-dependency-cache.md)).
+
+   Caching is split into `actions/cache/restore` + `actions/cache/save` with the save guarded on `cache-hit != 'true'`, so an exact hit never re-uploads ~1.3 GB. Adding a cache means adding **both** steps. The saves run **at the end of the job**, after `flutter pub get` and the Gradle build: a save placed before the build captures only the restored snapshot, so everything the build had just downloaded is discarded and re-fetched on every run. Each save targets the *primary* key — an exact hit skips it, and a prefix restore writes the primary key so the next run hits exactly. The Gradle key also carries the **Flutter version**, because the engine's dependency set follows it: without that dimension a Flutter bump would leave the key unchanged, the save would stay skipped, and the artifacts the build fetched would be re-fetched on every run.
+
+   Two deliberate exclusions:
+
+   - **Not all of `~/.gradle`.** On this project that tree is ~6.1 GB, of which `caches/9.1.0` is ~3.8 GB of path-keyed, per-version script caches that are rebuilt every time and are unsafe to replay onto a different workspace path. Only the downloaded distribution and module artifacts are cached.
+   - **Not `~/.android/build-cache`.** `android/gradle.properties` does not enable `buildCache`, so there is nothing to restore. Revisit only if that flag is turned on.
+
+3. **The Flutter engine artifacts are prefetched, not resolved by Gradle.** Gradle downloads the `io.flutter:*` engine artifacts without a retry, and the China mirror resets the TLS handshake often enough to fail a 30-minute build — and because the cache saves ran before the build, they were re-fetched on every run. [`tool/prefetch_flutter_engine_android_libs.sh`](../tool/prefetch_flutter_engine_android_libs.sh) fetches them with curl — retries, `Range` resume, speed limit — into `build/flutter-engine-maven/`, and `android/build.gradle.kts` lists that directory first so Gradle resolves `io.flutter:*` from disk. The prefetched directory gets its own `flutter-engine-<os>-<flutter-version>` cache entry, so the ~520 MB is fetched once per Flutter version rather than once per run. See [ADR-0101](decisions/0101-flutter-engine-artifact-prefetch.md).
+
+2. **China mirrors for cold dependency/SDK fetches.** `PUB_HOSTED_URL` (`https://pub.flutter-io.cn`) and `FLUTTER_STORAGE_BASE_URL` (`https://storage.flutter-io.cn`) are set as workflow-level `env:` on the six build/CI workflows, and `FLUTTER_STORAGE_BASE_URL` alone on the Apple/Windows release workflows; they are routed DIRECT by the local OpenClash rules, so a cold run (cache miss on the container pool, wiped store or new Flutter SDK on a native runner) does not fall back to paying the proxy for pub.dev or `storage.googleapis.com`. `.github/actions/setup-flutter` honors `FLUTTER_STORAGE_BASE_URL` when it has to install an SDK, defaulting to the upstream bucket when unset.
+
+   `PUB_HOSTED_URL` changes pub's default hosted source, so on the build/CI workflows `flutter pub get` re-resolves against the mirror: `pubspec.lock` is rewritten (pub.dev → mirror URLs) and versions move within their constraints (16 packages when last measured). That is a pre-existing ADR-0097 side-effect; the release workflows deliberately leave `PUB_HOSTED_URL` unset so a tag builds exactly the versions pinned in its commit, and only mirror the Flutter SDK download (`FLUTTER_STORAGE_BASE_URL`).
+
+   `pubspec.lock` pins every hosted package by `sha256`, so a mirror that served different bytes fails the hash check instead of installing something else — dependency integrity does not weaken by fetching through a mirror.
+
+**Not yet covered:** the agentic workflows (their gh-aw firewall allow-lists, compiled into the `.lock.yml` files) still resolve from pub.dev directly. Moving them to the mirrors means editing the allow-lists and recompiling the `.lock.yml` files.
+
+---
+
+## Baking dependencies into the runner instead of installing them per job
+
+This applies to **toolchains and OS-level prerequisites**, which land in `RUNNER_TOOL_CACHE` or the container image and therefore survive the per-job environment reset (container) or simply persist on the native runner's disk (macOS, Windows). On the container pool, package-level dependencies (`~/.pub-cache`, `~/.gradle`, CocoaPods) do **not** survive that reset and are handled by `actions/cache` instead; on the native runners they persist on disk and need no cache at all — see *Dependency caching and mirrors* above.
+
+- **Linux (shared gh-sr agentic pool):** gh-sr builds a Docker image for `runner_mode: container` / `profile: agentic` runners. `runners.yml`'s `container_runner_image.extra_apt_packages` bakes the Flutter Linux build packages (`clang`, `cmake`, `ninja-build`, `xz-utils`, `zip`, `libgtk-3-dev`, `liblzma-dev`, `libsqlite3-dev`) into that image, on top of the packages already in gh-sr's own core manifest (`curl`, `git`, `jq`, `pkg-config`, `unzip`, …). This survives `gh sr rebuild` / `gh sr update` (which recreate the container and would otherwise wipe anything installed at runtime by `ensure_linux_tooling.sh`).
+- **macOS / Windows (native runners):** gh-sr has no generic dependency-baking mechanism for native runners — the runner's own filesystem just persists between jobs as long as it isn't reinstalled from scratch. Install Flutter's OS-level prerequisites once, manually, per the checklists below; the idempotent scripts (`fetch_ffmpeg.ps1`, `ensure_nuget_feed.ps1`, `ensure_inno_setup.ps1`, `ensure_ios_ci_toolchain.sh`) then skip re-installing on every run.
+- **Flutter SDK itself (all platforms):** handled at the workflow level — [`.github/actions/setup-flutter`](../.github/actions/setup-flutter) for the deterministic build/release workflows, `jdx/mise-action` for `ci.yml` and the agentic workflows — see the table above.
+
+---
+
+## Agentic workflows (gh-aw)
+
+GitHub **Agentic Workflows** (`gh-aw`) run on a Linux self-hosted runner with labels **`self-hosted`**, **`linux`**, and **`agentic`**. The same physical machine may also carry the **`Linux`** label used by deterministic CI — that is fine; both share the Flutter pin in [`mise.toml`](../mise.toml).
+
+Each agentic job runs pre-agent steps declared in the workflow's own
+`.md` (for example [`repo-assist.md`](../.github/workflows/repo-assist.md))
+before the AI engine starts:
+
+1. `ensure_linux_tooling.sh` (apt packages, idempotent)
+2. `jdx/mise-action` — installs the Flutter version pinned in [`mise.toml`](../mise.toml)
+3. `flutter --version` (probe)
+4. `flutter pub get`
+
+**Scope:** AWF requires Linux. Agents can run `flutter analyze`, `flutter test`, and `dart format` here — not iOS/macOS/Windows builds or signed Android releases.
+
+**Network:** the compiled agentic workflow adds the gh-aw `dart` ecosystem (`pub.dev`, Flutter storage) to the firewall allowlist.
+
+**Compile:** After editing workflow `.md` files, run `gh aw compile --validate` and commit the generated `.lock.yml` files.
+
+**Update:** `gh aw update` pulls the upstream prompts and re-pins the referenced actions and container digests. The upstream sources, the update procedure, and the safe-update gate (secrets / actions / redirects / memory validation scripts) are documented in [features/agentic-workflows.md](features/agentic-workflows.md).
+
+Agentic workflow sources: `grumpy-reviewer`, `repo-assist`, `repo-status`, `weekly-repo-map`, `weekly-research`, `perf-improver`, `duplicate-code-detector`, `large-file-simplifier`. The compiled [`agentic_commands.yml`](../.github/workflows/agentic_commands.yml) is the issue-comment slash-command front for all of them (generated by gh-aw, `on: issues`). (The earlier `test-improver` / `issue-triage` / `update-docs` / `agentic-wiki-writer` sources were removed in the 2026-07–09 cleanups.)
+
+**Runner labels.** The sources above declare `runs-on: [self-hosted, linux, agentic]` in their frontmatter. All eight also declare a `runs-on-slim: [self-hosted, linux, slim]` variant, and the compiled `agentic_commands.yml` routes to the **`slim`** label — the lighter gh-sr runner blocks that carry it (see `runners.yml` in the gh-sr repo). The `agentic` and `slim` pools may be different-sized hosts in the same pool family; both share the Flutter pin in `mise.toml`.
+
+---
+
+## Register runners
+
+Runners are registered via `gh-sr` (`gh sr setup && gh sr up`), except where noted below. Labels must match workflow `runs-on`:
+
+| Workflow | Labels | gh-sr runner block |
+|----------|--------|---------------------|
+| CI, Codegen drift, Android APK smoke, Release Android | `self-hosted`, `Linux` | `baizhiheizi` (org-scoped, `profile: agentic`, shared with gh-aw) |
+| gh-aw agentic workflows (grumpy-reviewer, repo-assist, …) | `self-hosted`, `linux`, `agentic` | `baizhiheizi` (same pool as above) |
+| Build Apple, Release Apple | `self-hosted`, `macos` | `baizhiheizi-mac` (org-scoped, shared) |
+| Build Windows, Release Windows | `self-hosted`, `windows`, `flutter` | `enjoy-player-win` (repo-scoped, dedicated) |
+
+The **`macos`** label (GitHub's default for macOS self-hosted runners) is what Apple workflows target. An optional **`flutter`** custom label can be added to runner blocks for stricter routing, but it is **not** required by [`build_apple.yml`](../.github/workflows/build_apple.yml) or [`release_apple.yml`](../.github/workflows/release_apple.yml).
+
+`enjoy-player-win` is a **dedicated, repo-scoped** native Windows runner (introduced to close the gap where no self-hosted Windows runner previously existed — Release Windows used to run on GitHub-hosted `windows-latest`). Unlike the shared Linux/macOS org pools, it only serves `baizhiheizi/enjoy_player`.
+
+---
+
+## Linux runner checklist
+
+One machine (the shared gh-sr agentic pool) serves CI, codegen, and Android smoke jobs.
+
+The Flutter build packages below are baked into the gh-sr container image via `container_runner_image.extra_apt_packages` in `runners.yml` — after `gh sr rebuild`, they no longer need manual installation or a per-job `apt-get`. This list is kept here for reference and for any non-gh-sr / native Linux host:
+
+```bash
+# Flutter (pin lives in mise.toml; workflows install it themselves —
+# setup-flutter action, or mise in ci.yml)
+flutter --version
+flutter doctor
+
+# Java 17+ on PATH
+java -version
+
+# Android SDK (set in runner service env or ~/.profile)
+export ANDROID_SDK_ROOT="$HOME/Android/Sdk"   # example path
+sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+# Build deps — baked into the gh-sr agentic image; CI also runs
+# ensure_linux_tooling.sh idempotently as a safety net.
+sudo apt-get install -y \
+  clang cmake curl git ninja-build pkg-config unzip xz-utils zip \
+  libgtk-3-dev liblzma-dev libsqlite3-dev
+```
+
+Ensure the runner service inherits `PATH`, `ANDROID_SDK_ROOT`, and `JAVA_HOME`.
+
+---
+
+## macOS runner checklist
+
+See also [apple-release-ci.md](apple-release-ci.md) for signing secrets and release steps.
+
+```bash
+flutter --version
+xcodebuild -version
+pod --version
+brew bundle install --file=macos/Brewfile
+
+# One-time after Xcode upgrade (installs CoreSimulator + CLI components; needs admin once):
+sudo xcodebuild -runFirstLaunch
+
+# iOS smoke CI also runs this idempotently; pre-warm to avoid multi-GB downloads mid-job:
+xcodebuild -downloadPlatform iOS
+```
+
+The **Build Apple** workflow runs [`.github/scripts/ensure_ios_ci_toolchain.sh`](../.github/scripts/ensure_ios_ci_toolchain.sh) before iOS compile smoke. If `xcodebuild -runFirstLaunch` fails with *Authorization is required*, run the `sudo` command above on the runner Mac.
+
+Runner user must access Keychain certs when using `APPLE_USE_RUNNER_KEYCHAIN=true`.
+
+---
+
+## Windows runner checklist
+
+`gh-sr` has no automated dependency-baking for native Windows runners (that's Linux/container-image only — see above), so the following is a **one-time manual setup** on the host before `gh sr setup enjoy-player-win`:
+
+- **Visual Studio Build Tools** with the **"Desktop development with C++"** workload (required by `flutter build windows`), **plus the "C++ ATL for latest v143 build tools" component** — `flutter_secure_storage_windows` compiles `<atlstr.h>`, which ships only with ATL. ATL can silently disappear when Build Tools updates or the host is re-provisioned; both Windows workflows run `ensure_vs_cpp_atl.ps1` to detect this and self-heal (needs an elevated runner service; otherwise install the component manually via the VS Installer).
+- **Git** on `PATH`
+- **NuGet CLI** on `PATH` (WebView2 / `azure_speech` restore) — `ensure_nuget_feed.ps1` only configures the feed, it does not install `nuget` itself
+- **Chocolatey** — `ensure_inno_setup.ps1` falls back to `choco install innosetup` when Inno Setup isn't already present
+- **OpenSSH Server**, only if `gh-sr` will reach this host over SSH (not needed when the host's `addr: local`, as with `z13`)
+
+Once those are in place:
+
+```powershell
+flutter --version
+flutter doctor
+nuget help   # NuGet CLI on PATH for azure_speech / WebView2
+iscc /?      # Inno Setup, or let ensure_inno_setup.ps1 install it via choco
+```
+
+Windows workflows run `windows/scripts/fetch_ffmpeg.ps1`, `ensure_nuget_feed.ps1`, and (for releases) `ensure_inno_setup.ps1` automatically — all idempotent, so after the first run they no-op. For local builds see [packaging.md](packaging.md).
+
+---
+
+## Workflows
+
+| Workflow | Runner | Trigger | Notes |
+|----------|--------|---------|-------|
+| [ci.yml](../.github/workflows/ci.yml) | Linux | every PR (required check; job skipped unless `lib/`, `test/`, `packages/`, pubspec or CI setup changed); push touching those + manual | analyze, format, test |
+| [codegen_drift.yml](../.github/workflows/codegen_drift.yml) | Linux | every PR (required check; job skipped unless `lib/`, `packages/` or pubspec changed); push touching those + manual | build_runner drift check |
+| [android_apk_smoke.yml](../.github/workflows/android_apk_smoke.yml) | Linux | PR touching `packages/`, `android/`, pubspec; push also on `lib/`; + manual | APK + AAB compile smoke |
+| [build_linux.yml](../.github/workflows/build_linux.yml) | Linux | PR touching `packages/`, `linux/`, pubspec or CI setup; push also on `lib/`; + manual | Linux desktop build smoke (debug + release) |
+| [build_windows.yml](../.github/workflows/build_windows.yml) | self-hosted Windows | PR touching `packages/`, `windows/`, pubspec; push also on `lib/`; + manual | debug + release smoke |
+| [build_apple.yml](../.github/workflows/build_apple.yml) | macOS | PR touching `packages/`, `ios/`, `macos/`, pubspec; push also on `lib/`; + manual | iOS + macOS compile smoke |
+| [release_apple.yml](../.github/workflows/release_apple.yml) | macOS | `push: tags: "v*.*.*"` + manual (`workflow_dispatch`) | signed IPA, TestFlight, notarized macOS |
+| [release_android.yml](../.github/workflows/release_android.yml) | Linux | `push: tags: "v*.*.*"` + manual (`workflow_dispatch`) | signed AAB/APK for Play / sideload |
+| [release_windows.yml](../.github/workflows/release_windows.yml) | self-hosted Windows (`enjoy-player-win`) | `push: tags: "v*.*.*"` + manual (`workflow_dispatch`) | release build + Inno Setup installer |
+| [release_linux.yml](../.github/workflows/release_linux.yml) | Linux (`[self-hosted, Linux, ci]`) | `push: tags: "v*.*.*"` + manual (`workflow_dispatch`) | Linux AppImage build + publish |
+| [release_publish.yml](../.github/workflows/release_publish.yml) | GitHub-hosted `ubuntu-latest` | manual only (`workflow_dispatch`) | updates / finalizes the GitHub Release notes (drafts → published) |
+
+Each build/smoke workflow's `paths` filter lives inline in its own file. Path filters only apply to `pull_request`/`push`; `workflow_dispatch` always runs regardless of what changed. The four platform release workflows trigger on a `v*.*.*` tag push (how v0.10.0 shipped) and can also be dispatched manually; their `--publish` behavior is controlled by the `publish` input. `release_publish.yml` is dispatch-only and the repo's one GitHub-hosted workflow.
+
+**PR vs push scope.** The platform builds (Linux, Windows, Apple, Android) use a narrower `pull_request` path list than `push`: on a PR they run only when native, dependency or build-tooling inputs change (`linux/`, `windows/`, `ios/`, `macos/`, `android/`, `packages/`, pubspec, mise, their scripts/workflow). Dart-only (`lib/**`) PRs are covered by CI (analyze + tests) and get the platform builds on the push to `main`. To build a PR branch on demand: `gh workflow run build_windows.yml --ref <branch>`.
+
+**Required checks.** CI (`Analyze & test`) and `Codegen drift` trigger on every PR, so they always report and can be required by the `main` ruleset. A cheap `changes` job (GitHub-hosted `ubuntu-slim`) lists the PR's files and skips the real job when nothing relevant changed — a skipped job counts as passing. An API error or a failed `changes` job runs the checks rather than skipping them.
+
+**The relevance filter mirrors the push filter.** `ci.yml` and `codegen_drift.yml` each declare a `PATTERN` (the regex the `changes` job matches the PR's file list against) next to a `paths:` filter (the paths that trigger the workflow on a push). The two lists describe the same set of paths, so a pull request touching only a path in the `paths:` filter still runs its checks. `test/ci_workflow_path_filters_test.dart` pins that invariant: every `paths:` entry must be matched by the workflow's `PATTERN`, every literal entry must still exist, and a workflow that declares a `PATTERN` but yields no parsable `paths:` entries fails rather than silently stop guarding.
+
+**Approval gate.** PRs from outside the org (`github-actions[bot]` agentic PRs, Copilot, contributors — `author_association` not `OWNER`/`MEMBER`) resolve every job's `environment` to the protected [`ci-approval`](https://github.com/baizhiheizi/enjoy_player/settings/environments), so each run sits in **Waiting** until the required reviewer approves it (**Approve and run**). Org-member PRs (and agents acting with a member's token), `push` and `workflow_dispatch` resolve to the unprotected `ci-direct` and run immediately. Note this is an org-owned repo, so members report `MEMBER`, not `OWNER`. Reviewers for `ci-approval` are managed under **Settings → Environments → ci-approval**.
+
+All six build/CI workflows above set the China mirror `env:`. The four Linux (container-pool) workflows also cache their dependency stores through the LAN `gh-sr-cache` server; `build_apple` / `build_windows` do not, because their native runners keep those stores on disk. The Apple and Windows release workflows set only `FLUTTER_STORAGE_BASE_URL` (a cold Flutter SDK pulls from the mirror) and deliberately do not cache dependency stores: they run rarely, and a release build must resolve the committed `pubspec.lock` against live upstream indexes rather than a warm cache or a different hosted source.
+
+## DST-aware tests
+
+The container pool's zone is not pinned anywhere in the CI setup, and a zone that observes no daylight saving (UTC is the common case) would make such a test skip itself. `ci.yml` runs the file in a second step under an explicit DST zone:
+
+```yaml
+- name: Flutter test (calendar labels under a DST timezone)
+  env:
+    TZ: America/New_York
+    REQUIRE_DST_TIMEZONE: '1'
+  run: flutter test test/core/presentation/relative_day_label_test.dart
+```
+
+The Dart VM reads `TZ` once at process start, so the zone has to be set on the `flutter test` step rather than inside the test. The test skips itself when the local zone has no DST transition; `REQUIRE_DST_TIMEZONE=1` turns that skip into a failure, so a runner whose zone never took effect (missing tzdata) fails loudly instead of silently dropping the case.
+
+The relative-day label is the current case: it counts **calendar days**, and the 23-hour day a spring-forward transition creates is what breaks a count made between two local midnights. See [library.md](features/library.md#relative-day-label).

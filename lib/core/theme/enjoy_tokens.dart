@@ -1,0 +1,455 @@
+/// Design tokens: spacing, radii, motion, elevation, surfaces, shadows,
+/// breakpoints (ThemeExtension). Duet design language (ADR-0093) values;
+/// Aurora-named fields (ADR-0089) alias the Duet values until the rename pass.
+library;
+
+import 'dart:ui' show lerpDouble;
+
+import 'package:flutter/material.dart';
+
+import 'colors.dart';
+
+part 'tokens/accents_values.dart';
+part 'tokens/accents_accessors.dart';
+part 'tokens/components.dart';
+part 'tokens/effects.dart';
+part 'tokens/elevation.dart';
+part 'tokens/layout.dart';
+part 'tokens/motion.dart';
+part 'tokens/palette.dart';
+part 'tokens/radius.dart';
+part 'tokens/spaces.dart';
+
+/// Design tokens; use [EnjoyThemeTokens.of] from widgets.
+@immutable
+class EnjoyThemeTokens extends ThemeExtension<EnjoyThemeTokens> {
+  /// Tokens for [scheme]'s brightness.
+  factory EnjoyThemeTokens.build(ColorScheme scheme) {
+    final light = scheme.brightness == Brightness.light;
+    return EnjoyThemeTokens._(
+      _SpaceTokens.build(),
+      _RadiusTokens.build(),
+      _MotionTokens.build(),
+      _ElevationTokens.build(light: light),
+      _LayoutTokens.build(),
+      _ComponentTokens.build(),
+      _SurfaceColors.build(light: light),
+      _AccentColors.build(light: light, scheme: scheme),
+      _EffectTokens.build(),
+    );
+  }
+
+  const EnjoyThemeTokens._(
+    this._spaces,
+    this._radii,
+    this._motion,
+    this._elevation,
+    this._layout,
+    this._components,
+    this._palette,
+    this._accents,
+    this._effects,
+  );
+
+  final _SpaceTokens _spaces;
+  final _RadiusTokens _radii;
+  final _MotionTokens _motion;
+  final _ElevationTokens _elevation;
+  final _LayoutTokens _layout;
+  final _ComponentTokens _components;
+  final _SurfaceColors _palette;
+  final _AccentColors _accents;
+  final _EffectTokens _effects;
+
+  /// Soft-landing curve, cubic-bezier(.2, .8, .2, 1).
+  static const Curve ease = Cubic(0.2, 0.8, 0.2, 1);
+
+  /// Emphasized ease for selection indicators and sheet travel.
+  static const Curve emphasized = Cubic(0.3, 0.0, 0.0, 1.0);
+
+  /// Brand gradient (blue → violet) for Play, primary buttons, Pro, Upgrade.
+  LinearGradient get brand => const LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [AppColors.brandStart, AppColors.brandEnd],
+  );
+
+  /// Logo gradient (blue → violet) for the mark, rings, meters, covers.
+  LinearGradient get logo => LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [logoStart, logoEnd],
+  );
+
+  static EnjoyThemeTokens of(BuildContext context) {
+    return Theme.of(context).extension<EnjoyThemeTokens>() ??
+        EnjoyThemeTokens.build(Theme.of(context).colorScheme);
+  }
+
+  @override
+  EnjoyThemeTokens copyWith({
+    double? space4,
+    double? space8,
+    double? space12,
+    double? space16,
+    double? space20,
+    double? space24,
+    double? space32,
+    double? space40,
+    double? space48,
+    double? radiusSm,
+    double? radiusMd,
+    double? radiusLg,
+    double? radiusXl,
+    double? radiusFull,
+    double? elevationNone,
+    double? elevationCard,
+    double? elevationSheet,
+    double? elevationModal,
+    double? elevationBar,
+    double? elevationSurface,
+    double? breakpointCompact,
+    double? breakpointRail,
+    double? breakpointTranscriptSideBySide,
+    double? breakpointMarginDrawer,
+    Duration? motionFast,
+    Duration? motionStandard,
+    Duration? motionEnter,
+    Duration? motionExit,
+    Duration? motionMedium,
+    Duration? motionLens,
+    Duration? motionMargin,
+    Color? echoActive,
+    Color? blurActive,
+    Color? scoreGood,
+    Color? scoreWarn,
+    Color? scoreBad,
+    Color? scoreGoodContainer,
+    Color? scoreWarnContainer,
+    Color? scoreBadContainer,
+    Color? accentSoft,
+    Color? accentInk,
+    Color? intelligenceInk,
+    Color? echoInk,
+    Color? ccBadge,
+    EdgeInsets? transcriptLinePadding,
+    double? contentMaxWidth,
+    double? formMaxWidth,
+    double? hubMaxWidth,
+    double? pageGutterCompact,
+    double? pageGutter,
+    double? miniBarBlurSigma,
+    double? sidebarWidth,
+    double? sidebarBrandHeight,
+    double? transportHeight,
+    double? heroTitleLetterSpacing,
+    Color? glassTint,
+    Color? glassBorder,
+    Color? gradientStart,
+    Color? gradientEnd,
+    double? bottomNavHeight,
+    double? desktopGutter,
+    double? modalMaxWidth,
+    double? modalMaxWidthLarge,
+    double? focusRingWidth,
+    double? radiusXs,
+    double? radius2xl,
+    Color? canvas,
+    Color? card,
+    Color? popover,
+    Color? hairline,
+    Color? fill,
+    Color? textFaint,
+    Color? logoStart,
+    Color? logoEnd,
+    Color? topHighlight,
+    double? shellInset,
+    double? panelRadius,
+    double? controlHeightSm,
+    double? controlHeight,
+    double? controlHeightLg,
+    List<BoxShadow>? shadowLift,
+    List<BoxShadow>? shadowFloat,
+    List<BoxShadow>? shadowPopover,
+    Color? ground,
+    Color? paper,
+    Color? raised,
+    Color? sunk,
+    Color? line,
+    Color? ink,
+    Color? ink2,
+    Color? ink3,
+    Color? original,
+    Color? originalInk,
+    Color? originalSoft,
+    Color? you,
+    Color? youInk,
+    Color? youSoft,
+    Color? youLine,
+    Color? originalLine,
+    Color? onYou,
+    Color? brandInk,
+    Color? brandSoft,
+    Color? primary,
+    Color? onPrimary,
+    Color? danger,
+    Color? shape,
+    Color? tick,
+    Color? scrim,
+    Color? video,
+    Color? vocabNew,
+    Color? vocabLearning,
+    Color? vocabReviewing,
+    Color? vocabMastered,
+    double? radiusKeycap,
+    double? radiusBadge,
+    double? radiusSegmentThumb,
+    double? radiusControl,
+    double? radiusTile,
+    double? radiusCard,
+    double? radiusCardLarge,
+    double? radiusDialog,
+    double? radiusSheet,
+    double? touchTargetMin,
+    double? iconButtonSize,
+    double? iconButtonSizePhone,
+    double? segmentHeight,
+    double? chipHeight,
+    double? takeChipHeight,
+    double? playButtonSize,
+    double? playButtonSizePhone,
+    double? recordButtonSize,
+    double? recordButtonSizePhone,
+    double? originalPillWidth,
+    double? originalPillHeight,
+    double? originalButtonPhoneSize,
+    double? tabBarHeight,
+    double? tabBarSafeInset,
+    double? playerTopBarHeight,
+    double? subpageHeaderHeight,
+    double? rulerHitHeight,
+    double? marginWidth,
+    double? transcriptMaxListen,
+    double? transcriptMaxEcho,
+    double? videoColumnMin,
+    double? videoColumnMax,
+    double? videoColumnShare,
+    double? pageMaxBrowse,
+    double? pageMaxCraft,
+    double? pageMaxHub,
+    double? pageMaxForm,
+    double? gutter,
+    double? gutterPhone,
+    List<double>? echoLensOpacity,
+    double? referencePitchOpacity,
+    double? strokeReferencePitch,
+    double? strokeYourPitch,
+    double? strokeLoopBracket,
+    double? strokeRulerTrack,
+    List<BoxShadow>? shadowBrandButton,
+    List<BoxShadow>? shadowRecordButton,
+  }) {
+    return EnjoyThemeTokens._(
+      _spaces.copyWith(
+        space4: space4,
+        space8: space8,
+        space12: space12,
+        space16: space16,
+        space20: space20,
+        space24: space24,
+        space32: space32,
+        space40: space40,
+        space48: space48,
+        pageGutterCompact: pageGutterCompact,
+        pageGutter: pageGutter,
+        desktopGutter: desktopGutter,
+        marginWidth: marginWidth,
+        gutter: gutter,
+        gutterPhone: gutterPhone,
+      ),
+      _radii.copyWith(
+        radiusSm: radiusSm,
+        radiusMd: radiusMd,
+        radiusLg: radiusLg,
+        radiusXl: radiusXl,
+        radiusFull: radiusFull,
+        radiusXs: radiusXs,
+        radius2xl: radius2xl,
+        panelRadius: panelRadius,
+        radiusKeycap: radiusKeycap,
+        radiusBadge: radiusBadge,
+        radiusSegmentThumb: radiusSegmentThumb,
+        radiusControl: radiusControl,
+        radiusTile: radiusTile,
+        radiusCard: radiusCard,
+        radiusCardLarge: radiusCardLarge,
+        radiusDialog: radiusDialog,
+        radiusSheet: radiusSheet,
+      ),
+      _motion.copyWith(
+        motionFast: motionFast,
+        motionStandard: motionStandard,
+        motionEnter: motionEnter,
+        motionExit: motionExit,
+        motionMedium: motionMedium,
+        motionLens: motionLens,
+        motionMargin: motionMargin,
+      ),
+      _elevation.copyWith(
+        elevationNone: elevationNone,
+        elevationCard: elevationCard,
+        elevationSheet: elevationSheet,
+        elevationModal: elevationModal,
+        elevationBar: elevationBar,
+        elevationSurface: elevationSurface,
+        focusRingWidth: focusRingWidth,
+        shadowLift: shadowLift,
+        shadowFloat: shadowFloat,
+        shadowPopover: shadowPopover,
+        strokeReferencePitch: strokeReferencePitch,
+        strokeYourPitch: strokeYourPitch,
+        strokeLoopBracket: strokeLoopBracket,
+        strokeRulerTrack: strokeRulerTrack,
+        shadowBrandButton: shadowBrandButton,
+        shadowRecordButton: shadowRecordButton,
+      ),
+      _layout.copyWith(
+        breakpointCompact: breakpointCompact,
+        breakpointRail: breakpointRail,
+        breakpointTranscriptSideBySide: breakpointTranscriptSideBySide,
+        breakpointMarginDrawer: breakpointMarginDrawer,
+        contentMaxWidth: contentMaxWidth,
+        formMaxWidth: formMaxWidth,
+        hubMaxWidth: hubMaxWidth,
+        sidebarWidth: sidebarWidth,
+        sidebarBrandHeight: sidebarBrandHeight,
+        transportHeight: transportHeight,
+        bottomNavHeight: bottomNavHeight,
+        modalMaxWidth: modalMaxWidth,
+        modalMaxWidthLarge: modalMaxWidthLarge,
+        shellInset: shellInset,
+        tabBarHeight: tabBarHeight,
+        tabBarSafeInset: tabBarSafeInset,
+        playerTopBarHeight: playerTopBarHeight,
+        subpageHeaderHeight: subpageHeaderHeight,
+        rulerHitHeight: rulerHitHeight,
+        transcriptMaxListen: transcriptMaxListen,
+        transcriptMaxEcho: transcriptMaxEcho,
+        videoColumnMin: videoColumnMin,
+        videoColumnMax: videoColumnMax,
+        videoColumnShare: videoColumnShare,
+        pageMaxBrowse: pageMaxBrowse,
+        pageMaxCraft: pageMaxCraft,
+        pageMaxHub: pageMaxHub,
+        pageMaxForm: pageMaxForm,
+      ),
+      _components.copyWith(
+        miniBarBlurSigma: miniBarBlurSigma,
+        heroTitleLetterSpacing: heroTitleLetterSpacing,
+        controlHeightSm: controlHeightSm,
+        controlHeight: controlHeight,
+        controlHeightLg: controlHeightLg,
+        touchTargetMin: touchTargetMin,
+        iconButtonSize: iconButtonSize,
+        iconButtonSizePhone: iconButtonSizePhone,
+        segmentHeight: segmentHeight,
+        chipHeight: chipHeight,
+        takeChipHeight: takeChipHeight,
+        playButtonSize: playButtonSize,
+        playButtonSizePhone: playButtonSizePhone,
+        recordButtonSize: recordButtonSize,
+        recordButtonSizePhone: recordButtonSizePhone,
+        originalPillWidth: originalPillWidth,
+        originalPillHeight: originalPillHeight,
+        originalButtonPhoneSize: originalButtonPhoneSize,
+      ),
+      _palette.copyWith(
+        glassTint: glassTint,
+        glassBorder: glassBorder,
+        gradientStart: gradientStart,
+        gradientEnd: gradientEnd,
+        canvas: canvas,
+        card: card,
+        popover: popover,
+        hairline: hairline,
+        fill: fill,
+        textFaint: textFaint,
+        logoStart: logoStart,
+        logoEnd: logoEnd,
+        topHighlight: topHighlight,
+        ground: ground,
+        paper: paper,
+        raised: raised,
+        sunk: sunk,
+        line: line,
+        ink: ink,
+        ink2: ink2,
+        ink3: ink3,
+        shape: shape,
+        tick: tick,
+        scrim: scrim,
+        video: video,
+      ),
+      _accents.copyWith(
+        echoActive: echoActive,
+        blurActive: blurActive,
+        scoreGood: scoreGood,
+        scoreWarn: scoreWarn,
+        scoreBad: scoreBad,
+        scoreGoodContainer: scoreGoodContainer,
+        scoreWarnContainer: scoreWarnContainer,
+        scoreBadContainer: scoreBadContainer,
+        accentSoft: accentSoft,
+        accentInk: accentInk,
+        intelligenceInk: intelligenceInk,
+        echoInk: echoInk,
+        ccBadge: ccBadge,
+        original: original,
+        originalInk: originalInk,
+        originalSoft: originalSoft,
+        you: you,
+        youInk: youInk,
+        youSoft: youSoft,
+        youLine: youLine,
+        originalLine: originalLine,
+        onYou: onYou,
+        brandInk: brandInk,
+        brandSoft: brandSoft,
+        primary: primary,
+        onPrimary: onPrimary,
+        danger: danger,
+        vocabNew: vocabNew,
+        vocabLearning: vocabLearning,
+        vocabReviewing: vocabReviewing,
+        vocabMastered: vocabMastered,
+      ),
+      _effects.copyWith(
+        transcriptLinePadding: transcriptLinePadding,
+        echoLensOpacity: echoLensOpacity,
+        referencePitchOpacity: referencePitchOpacity,
+      ),
+    );
+  }
+
+  @override
+  ThemeExtension<EnjoyThemeTokens> lerp(
+    covariant ThemeExtension<EnjoyThemeTokens>? other,
+    double t,
+  ) {
+    if (other is! EnjoyThemeTokens) return this;
+    if (t == 0) return this;
+    if (t == 1) return other;
+
+    return EnjoyThemeTokens._(
+      _spaces.lerp(other._spaces, t),
+      _radii.lerp(other._radii, t),
+      _motion.lerp(other._motion, t),
+      _elevation.lerp(other._elevation, t),
+      _layout.lerp(other._layout, t),
+      _components.lerp(other._components, t),
+      _palette.lerp(other._palette, t),
+      _accents.lerp(other._accents, t),
+      _effects.lerp(other._effects, t),
+    );
+  }
+}

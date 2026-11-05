@@ -1,0 +1,280 @@
+import 'package:enjoy_player/core/application/app_preferences_provider.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_button.dart';
+import 'package:enjoy_player/core/theme/widgets/skeleton.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/domain/auth_state.dart';
+import 'package:enjoy_player/features/auth/domain/user_profile.dart';
+import 'package:enjoy_player/features/community/application/active_users_provider.dart';
+import 'package:enjoy_player/features/community/domain/active_user.dart';
+import 'package:enjoy_player/features/library/application/library_media_provider.dart';
+import 'package:enjoy_player/features/library/application/learning_statistics_provider.dart';
+import 'package:enjoy_player/features/library/domain/learning_statistics.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+import 'package:enjoy_player/features/library/presentation/home_screen.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:enjoy_player/data/subtitle/transcript_line.dart';
+import 'package:enjoy_player/features/library/application/continue_practice_provider.dart';
+import 'package:enjoy_player/features/library/domain/practice_resume.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_lines_provider.dart';
+import 'package:go_router/go_router.dart';
+
+class _SignedInAuthCtrl extends AuthCtrl {
+  @override
+  Future<AuthState> build() async => const AuthSignedIn(
+    profile: UserProfile(id: 'u1', email: 'a@b.com', name: 'A'),
+  );
+}
+
+class _FakePrefsCtrl extends AppPreferencesCtrl {
+  @override
+  Future<AppPreferencesState> build() async => AppPreferencesState.initial;
+}
+
+Media _recent({required String id, required String title}) {
+  final ts = DateTime.utc(2026, 2, 1);
+  return Media(
+    id: id,
+    kind: MediaKind.video,
+    title: title,
+    sourceUri: 'file:///$id',
+    durationMs: 60000,
+    language: 'en-US',
+    contentHash: id,
+    fileSize: 1,
+    createdAt: ts,
+    updatedAt: ts,
+  );
+}
+
+List<Override> _homeOverrides({
+  List<Media> recents = const [],
+  Stream<List<Media>>? streamOverride,
+  PracticeResume? resume,
+  List<TranscriptLine> resumeLines = const [],
+}) {
+  return [
+    continuePracticeResumeProvider.overrideWith((ref) => resume),
+    if (resume != null)
+      transcriptLinesForMediaProvider(
+        resume.media.id,
+      ).overrideWith((ref) => Stream.value(resumeLines)),
+    authCtrlProvider.overrideWith(_SignedInAuthCtrl.new),
+    appPreferencesCtrlProvider.overrideWith(_FakePrefsCtrl.new),
+    libraryHomeRecentsProvider.overrideWith(
+      (ref) => streamOverride ?? Stream.value(recents),
+    ),
+    learningStatisticsProvider.overrideWith(
+      (ref) async => LearningStatistics.empty(),
+    ),
+    activeUsersProvider.overrideWith(
+      (ref) async => const ActiveUsersResponse(users: [], count: 0),
+    ),
+  ];
+}
+
+Widget _themedHomeWithRouter(
+  GoRouter router, {
+  List<Override> overrides = const [],
+}) {
+  final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF7B61FF));
+  return ProviderScope(
+    overrides: overrides,
+    child: MaterialApp.router(
+      routerConfig: router,
+      theme: ThemeData(
+        colorScheme: scheme,
+        extensions: [EnjoyThemeTokens.build(scheme)],
+      ),
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+    ),
+  );
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('HomeScreen', () {
+    testWidgets(
+      "shows Today's Goal + Community cards even when recents is empty",
+      (tester) async {
+        final router = GoRouter(
+          initialLocation: '/',
+          routes: [
+            GoRoute(path: '/', builder: (context, state) => const HomeScreen()),
+          ],
+        );
+        await tester.pumpWidget(
+          _themedHomeWithRouter(router, overrides: _homeOverrides()),
+        );
+        await tester.pumpAndSettle();
+
+        final l10n = await AppLocalizations.delegate.load(const Locale('en'));
+
+        expect(find.text(l10n.homeEmptyTitle), findsOneWidget);
+
+        expect(find.text(l10n.homeTodaysGoal.toUpperCase()), findsOneWidget);
+        expect(find.text(l10n.communityToday.toUpperCase()), findsOneWidget);
+      },
+    );
+
+    testWidgets('Craft action navigates to /craft', (tester) async {
+      final router = GoRouter(
+        initialLocation: '/',
+        routes: [
+          GoRoute(path: '/', builder: (context, state) => const HomeScreen()),
+          GoRoute(
+            path: '/craft',
+            builder: (context, state) =>
+                const Scaffold(body: Text('craft-open')),
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        _themedHomeWithRouter(router, overrides: _homeOverrides()),
+      );
+      await tester.pumpAndSettle();
+
+      final l10n = await AppLocalizations.delegate.load(const Locale('en'));
+
+      await tester.tap(find.widgetWithText(EnjoyButton, l10n.homeCraftAction));
+      await tester.pumpAndSettle();
+
+      expect(find.text('craft-open'), findsOneWidget);
+      expect(router.state.uri.path, '/craft');
+    });
+
+    testWidgets('Continue practicing resumes the last session at its line', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1200, 1600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final media = _recent(id: 'ferry', title: 'The Ferry at Six');
+      final router = GoRouter(
+        initialLocation: '/',
+        routes: [
+          GoRoute(path: '/', builder: (context, state) => const HomeScreen()),
+          GoRoute(
+            path: '/player/:id',
+            builder: (context, state) =>
+                Text('player-${state.pathParameters['id']}'),
+          ),
+        ],
+      );
+      await tester.pumpWidget(
+        _themedHomeWithRouter(
+          router,
+          overrides: _homeOverrides(
+            recents: [media],
+            resume: PracticeResume(
+              media: media,
+              positionMs: 4500,
+              echoActive: true,
+              lastActiveAt: DateTime.utc(2026, 2, 1),
+              sessionId: 's1',
+            ),
+            resumeLines: const [
+              TranscriptLine(text: 'First line.', startMs: 0, durationMs: 4000),
+              TranscriptLine(
+                text: 'Second line.',
+                startMs: 4000,
+                durationMs: 4000,
+              ),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final l10n = await AppLocalizations.delegate.load(const Locale('en'));
+
+      expect(
+        find.text(l10n.homeContinuePracticing.toUpperCase()),
+        findsOneWidget,
+      );
+      expect(find.text('“Second line.”'), findsOneWidget);
+      expect(find.textContaining(l10n.homeContinueLine(2, 2)), findsOneWidget);
+
+      await tester.tap(find.text(l10n.homeContinueAction));
+      await tester.pumpAndSettle();
+      expect(find.text('player-ferry'), findsOneWidget);
+    });
+
+    testWidgets('recents grid leads with the last-practiced item', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(800, 2000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final router = GoRouter(
+        initialLocation: '/',
+        routes: [
+          GoRoute(path: '/', builder: (context, state) => const HomeScreen()),
+        ],
+      );
+      await tester.pumpWidget(
+        _themedHomeWithRouter(
+          router,
+          overrides: _homeOverrides(
+            recents: [
+              _recent(id: 'practiced-1', title: 'Practiced talk'),
+              _recent(id: 'other', title: 'Other item'),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final l10n = await AppLocalizations.delegate.load(const Locale('en'));
+
+      expect(find.text(l10n.homeContinuePracticing), findsNothing);
+      expect(find.text(l10n.homeRecentMedia), findsOneWidget);
+      expect(find.text('Practiced talk'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.text('Practiced talk')).dx,
+        lessThan(tester.getTopLeft(find.text('Other item')).dx),
+      );
+    });
+
+    testWidgets('loading recents shimmer on one shared ticker', (tester) async {
+      tester.view.physicalSize = const Size(1200, 2000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final router = GoRouter(
+        initialLocation: '/',
+        routes: [
+          GoRoute(path: '/', builder: (context, state) => const HomeScreen()),
+        ],
+      );
+      await tester.pumpWidget(
+        _themedHomeWithRouter(
+          router,
+          overrides: _homeOverrides(
+            recents: const [],
+            streamOverride: const Stream<List<Media>>.empty(),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 16));
+
+      expect(find.byType(Skeleton), findsWidgets);
+      expect(
+        find.byType(SkeletonTickerHost),
+        findsOneWidget,
+        reason: 'the whole loading scroll view shares one shimmer clock',
+      );
+    });
+  });
+}

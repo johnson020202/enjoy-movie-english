@@ -1,0 +1,205 @@
+# Discover (YouTube feeds)
+
+## Summary
+
+**Discover** helps users find YouTube videos to practice with when they do not already have a URL. Browse **recommended channels** (bundled catalog), **subscribe** to YouTube channels, handles, and playlists locally, view a merged **timeline** of recent uploads (fetched via a server-side RSSHub proxy), and **Add to library** to start echo / transcript workflows.
+
+Discover feeds are **not** library items until imported. Subscriptions are **Enjoy-local** — not YouTube account subscriptions. They are also **per-device**: the sync schema declares subscription variants (ADR-0010, ADR-0013), but nothing enqueues, uploads, or pulls them yet (issue #1176), so a subscription added on one device does not appear on another.
+
+## Navigation
+
+- Shell tab **Discover** → `/discover`
+- Channel feed → `/discover/channel/:channelId`
+- Home empty state → secondary **Browse Discover** action
+
+## Main screen (videos-first)
+
+The Discover tab shows a **merged video feed** only (responsive grid of recent uploads). A horizontal **filter strip** sits below the header:
+
+- **All** — timeline across all subscribed channels
+- **Channel avatars** — filter the feed to one subscription
+- **Manage channels** — opens subscription management (see below)
+
+Desktop: header **Refresh** button. No inline subscription or recommended lists on the main scroll.
+
+Feed tiles show the channel and a compact relative age (`discoverAgeLabel`: just now, `12m ago`, `3h ago`, yesterday, `4d ago`, then a short date); the "Updated …" caption beside **Recent uploads** uses the same helper. Imported entries carry a labeled **✓ In library** chip on the artwork instead of the **+ Add to library** button.
+
+Feed-tile meta rows ([`DiscoverFeedTile`](../../lib/features/discover/presentation/discover_feed_tile.dart)) render in their own `discoverFeedTileMetaHeight` budget (64 px): 6 gap + 2-line title (14 px × 1.25 leading = 35) + 2 gap + published line (12.5 px × 1.2 = 15) ≈ 58, plus 6 of air. The air is load-bearing — at the nominal leading the row lands within half a pixel of the 58 px budget the built-in meta block gets, so any font whose line box runs taller than its `height` multiplier (a platform fallback for `·` / `—`, the device's own text metrics) overflows the row by a couple of pixels. A row that still outgrows its budget grows the tile rather than overflowing; `discoverFeedTileGridAspectRatioForWidth` sizes each `SliverGrid` cell from the same budget so a grown tile stays inside its cell.
+
+## Manage channels
+
+Opened from the filter strip (bottom sheet on narrow layouts, centered dialog at `breakpointRail` and wider):
+
+- **Subscribe** (paste URL / `@handle` / channel ID / playlist ID)
+- **Your channels** — list with **Unsubscribe** (does not navigate away from the modal)
+- **Recommended** — bundled catalog (`assets/discover/recommended_channels.json`) with **Subscribe** / **Subscribed** badges; channels are **language-tagged** (English, Japanese, Korean, Spanish, French in the first wave). The list is filtered to the user's focus learning language by default, with **All languages** to browse everything.
+
+Empty Discover state (no subscriptions) prompts **Manage channels** so users can add recommended channels first.
+
+## Subscriptions (elsewhere)
+
+- Tap a subscription from **channel feed** app bar row context, or navigate to `/discover/channel/:channelId` from library flows as before
+- **Unsubscribe** in Manage channels or channel feed app bar removes the subscription and cached feed entries
+- Filter selection resets to **All** if the active channel is unsubscribed
+
+## Feed refresh
+
+| Trigger | Behavior |
+|---------|----------|
+| App launch | Debounced refresh for eligible sources |
+| Pull-to-refresh (mobile) | Force refresh all subscriptions |
+| Header refresh button (desktop) | Same as pull-to-refresh |
+| Periodic (8 h) | Background refresh while app runs |
+| Per-source skip | Skip if last fetch < 1 h unless forced |
+
+### Data source (single-source RSSHub proxy)
+
+The per-source refresh path is **single-source** ([ADR-0051](../decisions/0051-youtube-worker-discovery.md)):
+
+All video discovery requests go through a **server-side RSSHub proxy**, never directly to YouTube. The worker exposes three RSSHub YouTube routes:
+
+| Route | Example | Returns |
+|-------|---------|---------|
+| `GET /youtube/channel/{id}` | `/youtube/channel/UC...` | Channel feed (reverse-chronological) |
+| `GET /youtube/user/{handle}` | `/youtube/user/@TED` | Handle feed (resolves to channel) |
+| `GET /youtube/playlist/{id}` | `/youtube/playlist/PL...` | Playlist feed (playlist order) |
+
+The client requests JSON Feed v1.1 format (via `?format=json`). See the [worker feed API contract](../../specs/018-youtube-worker-discovery/contracts/worker-feed-api.md) for the full response schema.
+
+**Feed-level fields** from JSON Feed v1.1:
+- `title` — source display name (the client strips " - YouTube" suffix)
+- `home_page_url` — YouTube source URL (contains canonical channel/playlist ID)
+- `icon` — avatar URL
+
+**Item-level fields** from JSON Feed v1.1:
+- `id` — video ID (extracted from YouTube watch URL)
+- `url` — YouTube watch URL
+- `title` — video title
+- `image` — thumbnail URL
+- `date_published` — published timestamp (ISO 8601)
+- `attachments[].duration_in_seconds` — video duration
+
+The refresh client ([`YoutubeFeedClient`](../../lib/data/api/services/ai/youtube_feed_api.dart), provided by `youtubeFeedClientProvider` with bearer auth from `SecureTokenStore.readAccessToken`) handles:
+- HTTP status codes → typed exceptions (404 → notFound, 410 → sourceUnavailable, 429 → rateLimited, 502 → upstreamFailure)
+- Handle-to-ID canonicalization: when subscribing via @handle, the client extracts the canonical channel ID from `home_page_url` and uses `/youtube/channel/{id}` for subsequent refreshes
+- Network errors → networkError exception
+- Runtime repair: if a subscription's `feed_url` is missing, regenerate it before fetch (covers pre-v13 rows that missed the backfill)
+
+### Cache semantics (append-only)
+
+The `youtube_feed_entries` cache is **append-only between unsubscribe events** ([ADR-0046](../decisions/0046-discover-feed-append-only.md)). A refresh:
+
+- Inserts feed entries that are new to the cache (new uploads since the last refresh).
+- Updates mutable metadata (`title`, `thumbnailUrl`, `publishedAt`) and `fetchedAt` on entries the source re-presented.
+- **Does not delete** cached entries that fell out of the source's most-recent window (~15–50 entries).
+- Uses video ID deduplication — if all returned entries are already cached, no changes are made and `lastFetchedAt` is still updated.
+- Writes each source's upserts in **one Drift `batch` / transaction** (`YoutubeFeedEntryDao.upsertEntries`). Non-empty refreshes therefore emit a **single** `watchTimeline` update; empty responses are a no-op (no watcher churn).
+
+The user-visible way to bound cache growth is to **unsubscribe** from a source — `DiscoverRepository.unsubscribe(channelId)` deletes every cached entry for that channel.
+
+Duration: Comes from `attachments[].duration_in_seconds` in the JSON Feed response. No legacy watch-page HTML duration enrichment is performed.
+
+### Handle-to-ID canonicalization
+
+When a user subscribes via @handle (e.g., `https://youtube.com/@TED`):
+1. The client fetches `GET /youtube/user/@TED?format=json`
+2. The response `home_page_url` contains the canonical channel URL: `https://www.youtube.com/channel/UCAuUUnT6oDeKwE6v1NGQxug`
+3. The client extracts the channel ID (`UCAuUUnT6oDeKwE6v1NGQxug`) from this URL
+4. All subsequent refreshes use `GET /youtube/channel/UCAuUUnT6oDeKwE6v1NGQxug?format=json`
+
+This prevents duplicate subscriptions (handle + channel ID pointing to the same source) and avoids redundant handle resolution on every refresh.
+
+### YT source language removal
+
+Subscription rows may still store a catalog `language` column (schema v10) for recommended-channel bookkeeping, but the **DiscoverChannel** domain model and UI no longer expose a per-subscription language:
+
+- There is no **Language scope** toggle on the filter strip and no language label / editor on subscription rows.
+- **Add to library** does not infer media content language from a subscription; callers pass an explicit `contentLanguage` or default to `und` (`kUnknownMediaLanguageTag`).
+- Recommended-catalog filtering by the learner's focus language remains (catalog tags on bundled channels only).
+
+### Scheduler gating
+
+The periodic refresh is intentionally **passive**:
+
+- **Subscription-gated** — the 8 h `Timer` is only armed while the subscription list is non-empty.
+- **Lifecycle-gated** — periodic ticks and the post-launch initial refresh are skipped while the app is not in the foreground.
+- **Idempotent launch** — only one post-frame launch refresh is scheduled per provider instance.
+
+### Single-flight guard
+
+`DiscoverRefreshState` applies a **single-flight guard** at the provider level: if a `refresh()` call is already in-flight, concurrent callers await the same future instead of starting a redundant second HTTP round-trip.
+
+```
+Caller A ──► refresh() ──► _pendingRefresh = refreshFeeds()
+Caller B ──► refresh() ──► return _pendingRefresh!  (same future)
+Caller C ──► refresh() ──► return _pendingRefresh!  (same future)
+                      │
+                      ▼  all await the one in-flight future
+```
+
+- The `_pendingRefresh` field is set before `await` — the guard holds from the instant the first call enters, not after `refreshFeeds` resolves.
+- The guard is cleared in a `finally` block, so it is released even on exceptions.
+- This sits **above** the per-source concurrency cap — it prevents duplicate orchestration work (e.g., overlapping periodic timer fire + pull-to-refresh, or rapid double-tap on the refresh button).
+
+### Partial-failure surfacing
+
+`DiscoverRepository.refreshFeeds` returns `DiscoverRefreshResult { refreshedChannels, failedChannelIds }`. The UI consults `hasFailures` and surfaces per-source failures via `AppNotice.error`:
+
+- One failed source → `Could not refresh {name}.`
+- Many → `Could not refresh {count} sources: {names}`
+
+Successful sources keep their updated entries; only the failed ones' feed entries are left untouched.
+
+## Channel avatar cache
+
+Recommended row and subscription avatars are stored in the Drift `youtube_channel_subscriptions.thumbnailUrl` column (set from the feed's `icon` field on subscribe/refresh). An in-memory LRU cache (`L1Store`) provides fast lookup:
+
+- Capacity: **256 entries**
+- **TTL: 6 hours**
+- Lifecycle: lives for the lifetime of the repository instance
+
+Failures during avatar fetch return `null`, so the caller can fall back to a placeholder.
+
+## Sliver performance
+
+The merged feed grid and the channel feed grid both use stable `ValueKey<String>` — `discover-feed-<videoId>` on the merged feed, `channel-feed-<videoId>` on the channel feed — plus `findChildIndexCallback` via `findSliverIndexByPrefixedId` so a refresh that only prepends new entries reuses existing tile `Element`s.
+
+## Library membership in the feed
+
+The feed carries library membership as data, not as a widget concern (issue #764). [`discoverFeedItemsProvider`](../../lib/features/discover/application/discover_providers.dart) joins the feed stream with [`MediaRegistry.watchYoutubeVideoIds`](../../lib/data/db/media_registry.dart) in [`discover_feed_join.dart`](../../lib/features/discover/application/discover_feed_join.dart), and each tile takes `inLibrary` as a constructor argument. The same join (issue #810 G) also resolves each entry's channel display name and avatar from the subscription stream, so tiles take `channelName` / `channelAvatarUrl` as constructor arguments too instead of watching and linear-scanning the subscription list per build.
+
+Three consequences:
+
+- **No per-tile probes.** The feed previously ran one indexed `SELECT` per visible tile (`DiscoverFeedTile` probed in `initState` and cached the answer in widget state), which is roughly 15–25 queries per scroll burst. One subscription now serves the whole grid.
+- **Membership survives "add to library".** The import lands in `videos`, the registry stream re-emits, and the join re-projects. The tile no longer calls `ref.invalidate(libraryMediaProvider)` to patch itself.
+- **The join waits for all first values**, so the grid does not paint every tile as "not in library" and then flip them all on the library's first delivery.
+
+The join sits strictly above the append-only feed cache, so ADR-0046 is untouched: no insert, prune, or `deleteForChannel` path changed. The merged emission now also fires on library and subscription writes — `.distinctBy` keeps the tile list from rebuilding when the projection is unchanged.
+
+## Add to library
+
+Uses the same path as **Import → From YouTube URL**: oEmbed metadata, `videos` row with `provider: youtube`, optional sync enqueue when signed in. Duplicate video ids show **In library** instead of add. Media content language comes from an explicit import choice (or `und`), not from the subscription row.
+
+`DiscoverRepository` takes `libraryRepository` as a **required constructor argument**; the old `bindLibraryRepository` setter is gone, so a half-wired repository (one where "add to library" throws until something binds it) can no longer be constructed.
+
+## Transcripts
+
+No caption availability in the worker feed. After import, transcript loading follows [`transcript.md`](transcript.md) and [`youtube.md`](youtube.md).
+
+## Limitations
+
+- **Fixed feed size.** The RSSHub proxy returns a fixed set of entries (~15–50 per feed). Pagination and `since`-based incremental refresh are deferred to a follow-up enhancement.
+- **View count not available.** JSON Feed v1.1 does not expose view counts; the client cannot display per-video view counts from the worker feed.
+- **Worker dependency.** Initial subscription requires worker connectivity for feed fetching. Cached entries remain fully browsable offline.
+- **Subscriptions do not sync across devices.** `SyncYoutubeSubscriptionUpsert` / `SyncYoutubeSubscriptionDelete` and their serializers are declared ([`upsert_jobs.dart`](../../lib/features/sync/domain/sync_queue_job/upsert_jobs.dart)), but no producer enqueues them, the engine consumer drops them, and the download service never pulls them — [ADR-0021](../decisions/0021-youtube-discover-rss.md) keeps subscriptions local-only until that lands. Moving devices means re-adding channels by hand.
+- Subscriptions and feed cache live in the signed-in per-user SQLite file (`enjoy_player_<userId>`)
+- No hard upper bound on per-channel cache size in v1; users bound growth by unsubscribing (see [ADR-0046](../decisions/0046-discover-feed-append-only.md))
+
+## Related
+
+- [ADR-0051](../decisions/0051-youtube-worker-discovery.md) — moved YouTube discovery to server-side RSSHub proxy
+- [ADR-0021](../decisions/0021-youtube-discover-rss.md) — original RSS-only discovery (superseded by 0051)
+- [ADR-0046](../decisions/0046-discover-feed-append-only.md) — append-only feed cache
+- [ADR-0047](../decisions/0047-youtube-discover-innertube.md) — InnerTube primary source (superseded by 0051)
+- [Worker feed API contract](../../specs/018-youtube-worker-discovery/contracts/worker-feed-api.md)
+- [youtube.md](youtube.md)

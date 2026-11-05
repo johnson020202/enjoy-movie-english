@@ -1,0 +1,143 @@
+name: Release Apple
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      upload_testflight:
+        description: Upload iOS IPA to TestFlight
+        type: boolean
+        default: true
+      notarize_macos:
+        description: Notarize macOS .app for direct download
+        type: boolean
+        default: true
+      publish:
+        description: Upload macOS zip + update feeds on dl.enjoy.bot
+        type: boolean
+        default: false
+      publish_github:
+        description: Upload binaries to the GitHub Release for this tag (draft; finalize via release_publish.yml)
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-apple-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+# Same HTTP/2-drop hardening as build_apple.yml: pin git to HTTP/1.1 for
+# checkout and every step; apple_spm_hygiene.sh sets the same override for
+# the build steps. FLUTTER_STORAGE_BASE_URL matches build_apple.yml so a cold
+# Flutter SDK (version bump, wiped tool cache) pulls from the CN mirror instead
+# of storage.googleapis.com through the WAN proxy.
+#
+# PUB_HOSTED_URL is deliberately NOT set here (unlike the build workflows):
+# it makes pub treat the committed pub.dev lock as a different hosted source
+# and re-resolve, rewriting pubspec.lock to mirror URLs and moving versions
+# within constraints. A tagged release must build the exact versions pinned in
+# the tag's pubspec.lock, so releases resolve against the upstream default
+# source instead — releases are rare enough that the extra proxy bytes on a
+# cold pub cache are acceptable.
+env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: http.version
+  GIT_CONFIG_VALUE_0: HTTP/1.1
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
+jobs:
+  release:
+    name: iOS + macOS release
+    runs-on: [self-hosted, macos]
+    env:
+      APPLE_USE_RUNNER_KEYCHAIN: ${{ vars.APPLE_USE_RUNNER_KEYCHAIN || 'true' }}
+      NOTARY_PROFILE: enjoy-notary
+      MACOS_APP_PATH: build/macos/Build/Products/Release/Enjoy Player.app
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-macos-runner-env
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Build Apple release
+        env:
+          # Forwarded to flutter build as --dart-define (analytics_config.dart).
+          # Unset ⇒ binary ships analytics-inert.
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          IOS_DISTRIBUTION_CERT_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERT_BASE64 }}
+          IOS_DISTRIBUTION_CERT_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERT_PASSWORD }}
+          MACOS_DEVELOPER_ID_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERT_BASE64 }}
+          MACOS_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY }}
+        run: |
+          args=()
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/v* ]] ||
+             [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.notarize_macos }}" == "true" ]]; then
+            args+=(--notarize)
+          fi
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/v* ]] ||
+             [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.upload_testflight }}" == "true" ]]; then
+            args+=(--testflight)
+          fi
+          bash .github/scripts/release_apple.sh "${args[@]}"
+
+      - name: Publish macOS direct-download feeds
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL_S3: ${{ secrets.AWS_ENDPOINT_URL_S3 }}
+          PUBLISH_BUCKET: ${{ secrets.PUBLISH_BUCKET }}
+          PUBLISH_PREFIX: ${{ secrets.PUBLISH_PREFIX || 'player' }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          RELEASE_REQUIRE_S3: "1"
+        run: |
+          bash .github/scripts/ensure_publish_tooling.sh
+          bash .github/scripts/release_apple.sh --publish-only --publish
+
+      - name: Upload binaries to GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Enjoy Player ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            EnjoyPlayer-macOS-v*.zip
+            build/ios/ipa/EnjoyPlayer-v*.ipa
+
+      - name: Read pubspec version
+        id: read_version
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_github
+        shell: bash
+        run: echo "version=$(bash .github/scripts/read_pubspec_version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binaries to GitHub Release (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_github
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.read_version.outputs.version }}
+          name: Enjoy Player v${{ steps.read_version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            EnjoyPlayer-macOS-v*.zip
+            build/ios/ipa/EnjoyPlayer-v*.ipa

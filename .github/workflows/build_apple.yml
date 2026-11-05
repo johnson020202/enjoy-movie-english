@@ -1,0 +1,177 @@
+name: Build Apple (iOS + macOS)
+
+on:
+  # PRs build only when native, dependency or build-tooling inputs change;
+  # Dart-only changes are covered by CI (analyze + tests) on the PR and by
+  # this build on the push to main. Run it on a PR branch on demand with:
+  #   gh workflow run build_apple.yml --ref <branch>
+  pull_request:
+    paths:
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "ios/**"
+      - "macos/**"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/actions/setup-macos-runner-env/**"
+      - ".github/scripts/ensure_ios_ci_toolchain.sh"
+      - ".github/scripts/apple_spm_hygiene.sh"
+      - ".github/scripts/build_ios_ci.sh"
+      - ".github/scripts/build_macos_ci.sh"
+      - ".github/scripts/check_bundled_espeak_data.sh"
+      - ".github/workflows/build_apple.yml"
+  push:
+    branches: main
+    paths:
+      - "lib/**"
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "analysis_options.yaml"
+      - "ios/**"
+      - "macos/**"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/actions/setup-macos-runner-env/**"
+      - ".github/scripts/ensure_ios_ci_toolchain.sh"
+      - ".github/scripts/apple_spm_hygiene.sh"
+      - ".github/scripts/build_ios_ci.sh"
+      - ".github/scripts/build_macos_ci.sh"
+      - ".github/scripts/check_bundled_espeak_data.sh"
+      - ".github/workflows/build_apple.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Dependency downloads must not reach pub.dev / storage.googleapis.com through
+# the per-GB proxy; these mirrors are routed DIRECT. pubspec.lock pins every
+# package by sha256, so a mirror serving different bytes fails the hash check.
+# PUB_HOSTED_URL changes the default hosted source, so pub re-resolves the lock
+# against the mirror in these build jobs (versions can move within constraints);
+# the release workflows omit PUB_HOSTED_URL so a tag ships the exact versions in
+# its committed pubspec.lock.
+#
+# This host's route to github.com drops HTTP/2 connections mid-transfer
+# (LibreSSL SSL_ERROR_SYSCALL), which killed checkouts during network
+# brownouts. git 2.31+ honors GIT_CONFIG_* env vars, so pin HTTP/1.1 for
+# every step including checkout; apple_spm_hygiene.sh sets the same override
+# for the build steps.
+#
+# One `env:` block only: a second top-level `env:` key is a duplicate YAML
+# key, which GitHub rejects as an invalid workflow file (no jobs ever run).
+env:
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: http.version
+  GIT_CONFIG_VALUE_0: HTTP/1.1
+
+jobs:
+  ios:
+    name: iOS smoke
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, macos]
+    steps:
+      - uses: actions/checkout@v6
+
+      # No actions/cache for pub or CocoaPods here: this job runs on a native
+      # (non-container) self-hosted runner whose $HOME persists across jobs —
+      # ~/.pub-cache, ~/.cocoapods and ~/Library/Caches/CocoaPods survive runs
+      # on local disk, and the LAN cache server only exists for gh-sr container
+      # runners. Restoring from GitHub's cache service downloaded ~1 GB of pub
+      # cache per job through the WAN proxy (~8 min each) for data that was
+      # already on disk, and a cache miss re-uploaded it. The container-pool
+      # workflows (ci.yml, codegen_drift.yml, build_linux.yml,
+      # android_apk_smoke.yml) keep their restore/save pairs — there the cache
+      # backend is the LAN cache server and a hit costs zero WAN bytes.
+      #
+      # `pod install` still hits the network for new pod versions only
+      # (spec-repo + source archives land in the persistent dirs above).
+
+      - uses: ./.github/actions/setup-macos-runner-env
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: CocoaPods install (iOS)
+        run: cd ios && pod install
+
+      - name: Ensure iOS Xcode components
+        run: bash .github/scripts/ensure_ios_ci_toolchain.sh
+
+      - name: Flutter build ios (debug, compile-only)
+        run: bash .github/scripts/build_ios_ci.sh Debug
+
+      - name: Flutter build ios (release, compile-only)
+        run: bash .github/scripts/build_ios_ci.sh Release
+
+      - name: Assert eSpeak data in iOS Runner.app
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r app; do
+            bash .github/scripts/check_bundled_espeak_data.sh \
+              "${app}/espeak-ng-data" \
+              "${app}/Frameworks/eSpeakNG.framework/eSpeakNG"
+            found=1
+          done < <(find build/ios/DerivedData/Build/Products -name Runner.app -type d)
+          test "$found" -eq 1
+
+  macos:
+    name: macOS smoke
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, macos]
+    steps:
+      - uses: actions/checkout@v6
+
+      # No actions/cache for pub or CocoaPods here either — same reasoning as
+      # the iOS job above: native runner, persistent $HOME, no LAN cache
+      # server for native runners; the GitHub-cache round-trips were pure
+      # WAN-proxy traffic (and ~8 min per restore) for already-local data.
+
+      - uses: ./.github/actions/setup-macos-runner-env
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Install Homebrew deps (FFmpeg kit)
+        run: brew bundle install --file=macos/Brewfile
+
+      - name: Build compat dylibs (macOS 12 floor)
+        run: bash macos/scripts/build_compat_dylibs.sh
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: CocoaPods install (macOS)
+        run: cd macos && pod install
+
+      - name: Flutter build macos (debug)
+        run: bash .github/scripts/build_macos_ci.sh Debug
+
+      - name: Flutter build macos (release, compile-only)
+        run: bash .github/scripts/build_macos_ci.sh Release
+
+      - name: Assert eSpeak data in macOS app bundle
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r app; do
+            bash .github/scripts/check_bundled_espeak_data.sh \
+              "${app}/Contents/Resources/espeak-ng-data" \
+              "${app}/Contents/Frameworks/libespeak-ng.dylib"
+            found=1
+          done < <(find build/macos/Build/Products -name 'Enjoy Player.app' -type d)
+          test "$found" -eq 1

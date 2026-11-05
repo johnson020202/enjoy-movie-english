@@ -1,0 +1,378 @@
+import 'dart:async';
+
+import 'package:drift/native.dart';
+import 'package:enjoy_player/core/theme/widgets/media_card.dart';
+import 'package:enjoy_player/data/api/api_client.dart';
+import 'package:enjoy_player/data/api/services/audio_api.dart';
+import 'package:enjoy_player/data/api/services/video_api.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/domain/auth_state.dart';
+import 'package:enjoy_player/features/auth/domain/user_profile.dart';
+import 'package:enjoy_player/features/auth/presentation/widgets/auth_required_callout.dart';
+import 'package:enjoy_player/features/cloud/application/cloud_add_to_library.dart';
+import 'package:enjoy_player/features/cloud/application/cloud_providers.dart';
+import 'package:enjoy_player/features/cloud/data/cloud_index_repository.dart';
+import 'package:enjoy_player/features/cloud/domain/remote_library_item.dart';
+import 'package:enjoy_player/features/cloud/presentation/cloud_library_body.dart';
+import 'package:enjoy_player/features/player/application/player_controller.dart';
+import 'package:enjoy_player/features/player/domain/playback_session.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+
+class _SignedInAuthCtrl extends AuthCtrl {
+  @override
+  Future<AuthState> build() async => const AuthSignedIn(
+    profile: UserProfile(id: 'test-user', email: 't@example.com', name: 'Test'),
+  );
+}
+
+class _SignedOutAuthCtrl extends AuthCtrl {
+  @override
+  Future<AuthState> build() async => const AuthSignedOut();
+}
+
+class _NullPlayerController extends PlayerController {
+  @override
+  PlaybackSession? build() => null;
+}
+
+/// Membership check that never resolves until [completer] completes.
+class _PendingCloudAddToLibrary extends CloudAddToLibrary {
+  _PendingCloudAddToLibrary(super.db, this.completer);
+
+  final Completer<bool> completer;
+
+  @override
+  Future<bool> isInLibrary(RemoteLibraryItem item) => completer.future;
+}
+
+PlaybackSession _session(String mediaId) {
+  return PlaybackSession(
+    mediaId: mediaId,
+    dexieTargetType: 'Audio',
+    mediaType: 'audio',
+    mediaTitle: 'Podcast Episode 1',
+    durationSeconds: 300,
+    currentTimeSeconds: 0,
+    currentSegmentIndex: 0,
+    language: 'en',
+    startedAt: DateTime(2024, 1, 1),
+    lastActiveAt: DateTime(2024, 1, 1),
+  );
+}
+
+/// A fake [CloudIndexRepository] that returns canned items.
+class _FakeCloudIndexRepository extends CloudIndexRepository {
+  _FakeCloudIndexRepository({
+    this.fakeAudios = const [],
+    this.fakeVideos = const [],
+  }) : super(
+         audioApi: AudioApi(_dummyClient()),
+         videoApi: VideoApi(_dummyClient()),
+       );
+
+  final List<RemoteLibraryItem> fakeAudios;
+  final List<RemoteLibraryItem> fakeVideos;
+
+  @override
+  Future<List<RemoteLibraryItem>> fetchAudios({String? updatedAfter}) async =>
+      fakeAudios;
+
+  @override
+  Future<List<RemoteLibraryItem>> fetchVideos({String? updatedAfter}) async =>
+      fakeVideos;
+}
+
+ApiClient _dummyClient() {
+  return ApiClient(
+    httpClient: MockClient((_) async => http.Response('', 404)),
+    getBaseUrl: () async => 'http://localhost',
+    getAccessToken: () async => null,
+  );
+}
+
+RemoteLibraryItem _audioItem({
+  String id = 'audio-1',
+  String title = 'Podcast Episode 1',
+  String language = 'en',
+  int durationSeconds = 300,
+}) {
+  return RemoteLibraryItem(
+    id: id,
+    isVideo: false,
+    title: title,
+    durationSeconds: durationSeconds,
+    language: language,
+    provider: 'user',
+    rawJson: {'id': id, 'updatedAt': '2024-01-01T00:00:00Z'},
+  );
+}
+
+RemoteLibraryItem _videoItem({
+  String id = 'video-1',
+  String title = 'Lecture 1',
+}) {
+  return RemoteLibraryItem(
+    id: id,
+    isVideo: true,
+    title: title,
+    durationSeconds: 600,
+    language: 'en',
+    provider: 'user',
+    rawJson: {'id': id, 'updatedAt': '2024-01-01T00:00:00Z'},
+  );
+}
+
+Widget _wrap({required Widget child, required List<Override> overrides}) {
+  return ProviderScope(
+    overrides: overrides,
+    child: MaterialApp(
+      localizationsDelegates: const [
+        AppLocalizations.delegate,
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+      ],
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: Scaffold(body: child),
+    ),
+  );
+}
+
+/// Builds a [CloudLibraryBody] inside a [DefaultTabController] harness.
+Widget _harness({
+  required List<Override> overrides,
+  int initialTabIndex = 0,
+  GlobalKey<CloudLibraryBodyState>? stateKey,
+}) {
+  return _wrap(
+    overrides: overrides,
+    child: DefaultTabController(
+      length: 2,
+      initialIndex: initialTabIndex,
+      child: Builder(
+        builder: (context) {
+          final tabController = DefaultTabController.of(context);
+          return CloudLibraryBody(key: stateKey, tabController: tabController);
+        },
+      ),
+    ),
+  );
+}
+
+void main() {
+  late AppDatabase db;
+
+  setUp(() {
+    db = AppDatabase(executor: NativeDatabase.memory());
+  });
+
+  tearDown(() async {
+    await db.close();
+  });
+
+  List<Override> signedInOverrides({
+    List<RemoteLibraryItem> audios = const [],
+    List<RemoteLibraryItem> videos = const [],
+    CloudAddToLibrary? addToLibrary,
+  }) {
+    return [
+      appDatabaseProvider.overrideWithValue(db),
+      authCtrlProvider.overrideWith(_SignedInAuthCtrl.new),
+      playerControllerProvider.overrideWith(_NullPlayerController.new),
+      cloudIndexRepositoryProvider.overrideWithValue(
+        _FakeCloudIndexRepository(fakeAudios: audios, fakeVideos: videos),
+      ),
+      cloudAddToLibraryProvider.overrideWithValue(
+        addToLibrary ?? CloudAddToLibrary(db),
+      ),
+    ];
+  }
+
+  group('CloudLibraryBody', () {
+    testWidgets('shows auth required callout when signed out', (tester) async {
+      await tester.pumpWidget(
+        _harness(
+          overrides: [
+            authCtrlProvider.overrideWith(_SignedOutAuthCtrl.new),
+            playerControllerProvider.overrideWith(_NullPlayerController.new),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(AuthRequiredCallout), findsOneWidget);
+    });
+
+    testWidgets('shows video grid with items when signed in', (tester) async {
+      final stateKey = GlobalKey<CloudLibraryBodyState>();
+      await tester.pumpWidget(
+        _harness(
+          stateKey: stateKey,
+          overrides: signedInOverrides(
+            videos: [
+              _videoItem(id: 'v1', title: 'Lecture 1'),
+              _videoItem(id: 'v2', title: 'Lecture 2'),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      stateKey.currentState!.refreshActiveTab();
+      await tester.pumpAndSettle();
+
+      expect(find.text('Lecture 1'), findsOneWidget);
+      expect(find.text('Lecture 2'), findsOneWidget);
+    });
+
+    testWidgets('shows audio list on second tab', (tester) async {
+      final stateKey = GlobalKey<CloudLibraryBodyState>();
+      await tester.pumpWidget(
+        _harness(
+          stateKey: stateKey,
+          initialTabIndex: 1,
+          overrides: signedInOverrides(
+            audios: [
+              _audioItem(id: 'a1', title: 'Podcast Episode 1'),
+              _audioItem(id: 'a2', title: 'Podcast Episode 2'),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      stateKey.currentState!.refreshActiveTab();
+      await tester.pumpAndSettle();
+
+      expect(find.text('Podcast Episode 1'), findsOneWidget);
+      expect(find.text('Podcast Episode 2'), findsOneWidget);
+    });
+
+    testWidgets(
+      'hides unknown language badge and zero duration on audio rows',
+      (tester) async {
+        final stateKey = GlobalKey<CloudLibraryBodyState>();
+        await tester.pumpWidget(
+          _harness(
+            stateKey: stateKey,
+            initialTabIndex: 1,
+            overrides: signedInOverrides(
+              audios: [
+                _audioItem(
+                  id: 'a1',
+                  title: 'Her curiosity',
+                  language: 'und',
+                  durationSeconds: 0,
+                ),
+                _audioItem(id: 'a2', title: 'American life', language: 'en'),
+              ],
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        stateKey.currentState!.refreshActiveTab();
+        await tester.pumpAndSettle();
+
+        expect(find.text('Her curiosity'), findsOneWidget);
+        expect(find.text('UND'), findsNothing);
+        expect(find.text('0:00'), findsNothing);
+        expect(find.text('EN'), findsOneWidget);
+        expect(find.text('5:00'), findsOneWidget);
+      },
+    );
+
+    testWidgets('shows empty state for videos when no items', (tester) async {
+      final stateKey = GlobalKey<CloudLibraryBodyState>();
+      await tester.pumpWidget(
+        _harness(
+          stateKey: stateKey,
+          overrides: signedInOverrides(videos: []),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      stateKey.currentState!.refreshActiveTab();
+      await tester.pumpAndSettle();
+
+      expect(find.text('No cloud video yet'), findsOneWidget);
+    });
+
+    testWidgets('shows empty state for audios when no items', (tester) async {
+      final stateKey = GlobalKey<CloudLibraryBodyState>();
+      await tester.pumpWidget(
+        _harness(
+          stateKey: stateKey,
+          initialTabIndex: 1,
+          overrides: signedInOverrides(audios: []),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      stateKey.currentState!.refreshActiveTab();
+      await tester.pumpAndSettle();
+
+      expect(find.text('No cloud audio yet'), findsOneWidget);
+    });
+
+    testWidgets('pending membership rows skip player rebuilds until resolved', (
+      tester,
+    ) async {
+      final membership = Completer<bool>();
+      final stateKey = GlobalKey<CloudLibraryBodyState>();
+      await tester.pumpWidget(
+        _harness(
+          stateKey: stateKey,
+          initialTabIndex: 1,
+          overrides: signedInOverrides(
+            audios: [_audioItem(id: 'a1')],
+            addToLibrary: _PendingCloudAddToLibrary(db, membership),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      stateKey.currentState!.refreshActiveTab();
+      await tester.pumpAndSettle();
+
+      final container = ProviderScope.containerOf(
+        tester.element(find.byType(CloudLibraryBody)),
+        listen: false,
+      );
+      MediaCardRow currentRow() =>
+          tester.widget<MediaCardRow>(find.byType(MediaCardRow));
+
+      final before = currentRow();
+      expect(before.heroArtworkMediaId, isNull);
+
+      container
+          .read(playerControllerProvider.notifier)
+          .publishSession(_session('a1'));
+      await tester.pump();
+      expect(
+        identical(currentRow(), before),
+        isTrue,
+        reason:
+            'a not-yet-in-library row does not subscribe to playback changes',
+      );
+
+      membership.complete(true);
+      await tester.pumpAndSettle();
+      expect(currentRow().heroArtworkMediaId, isNull);
+
+      container
+          .read(playerControllerProvider.notifier)
+          .publishSession(_session('a2'));
+      await tester.pumpAndSettle();
+      expect(currentRow().heroArtworkMediaId, 'a1');
+    });
+  });
+}

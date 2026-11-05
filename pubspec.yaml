@@ -1,0 +1,175 @@
+name: enjoy_player
+description: Cross-platform audio/video player for language learning with transcripts and shadow reading.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  cross_file: ^0.3.5
+  cached_network_image: ^3.4.1
+  crypto: ^3.0.6
+  archive: ^4.0.7
+  async: ^2.13.0
+  azure_speech:
+    path: packages/azure_speech
+  forced_alignment:
+    path: packages/forced_alignment
+  drift: ^2.31.0
+  drift_flutter: ^0.3.1
+  # Pre-release dep (single-publisher supply chain) — pinned exactly so a
+  # fresh `pub get` cannot upgrade without an explicit PR. See ADR-0029.
+  file_picker: ^12.0.0
+  freezed_annotation: ^3.1.0
+  flutter_riverpod: ^3.3.2
+  flutter_secure_storage: ^10.2.0
+  go_router: ^17.2.3
+  http: ^1.4.0
+  google_fonts: ^8.1.0
+  intl: ^0.20.2
+  json_annotation: ^4.12.0
+  logging: ^1.3.0
+  meta: ^1.16.0
+  media_kit: ^1.2.2
+  media_kit_libs_video: ^1.0.7
+  media_kit_video: ^2.0.0
+  audioplayers: ^6.1.0
+  ffmpeg_kit_flutter_new:
+    path: packages/ffmpeg_kit_flutter_new
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  sqlite3: ^3.5.0
+  package_info_plus: ^10.1.0
+  # Pre-release / single-publisher deps (Windows + mobile auto-update flow).
+  # Pinned exactly so `pub get` cannot silently upgrade; bump via PR. See
+  # ADR-0029.
+  auto_updater: ^1.0.0
+  ota_update: 7.1.0
+  record: ^7.0.0
+  riverpod_annotation: ^4.0.3
+  sqlite3_flutter_libs: ^0.6.0+eol
+  url_launcher: ^6.3.1
+  google_sign_in: ^7.2.0
+  sign_in_with_apple: ^8.1.0
+  app_links: ^7.2.1
+  uuid: ^4.5.1
+  palette_generator: ^0.3.3+7
+  # Product analytics (specs/046-posthog-analytics-integration). Manual init:
+  # AUTO_INIT=false in each platform manifest; token arrives via --dart-define
+  # (lib/core/analytics/analytics_config.dart). No token ⇒ fully inert.
+  posthog_flutter: ^5.39.0
+  flutter_inappwebview: 6.2.0-beta.3
+  flutter_markdown_plus: ^1.0.12
+  flutter_svg: ^2.2.3
+  qr_flutter: ^4.1.0
+  share_plus: ^13.3.0
+  # FFI setenv for the Linux webview software-GL fallback (specs/047 T047).
+  ffi: ^2.1.0
+  showcaseview: ^5.1.0
+  window_manager: ^0.5.1
+  ai_sdk_dart: ^1.2.0
+  ai_sdk_openai: ^1.2.0
+  ai_sdk_anthropic: ^1.2.0
+  ai_sdk_google: ^1.2.0
+  ai_sdk_provider: ^1.2.0
+  flutter_timezone: ^5.1.0
+  # Pin `jni_flutter` >= 1.0.2 so the transitive `jni` resolves past the
+  # retracted 1.0.1 (Flutter pub surfaces a "version 1.0.1 is retracted"
+  # warning otherwise). The `jni` 1.0.3 API used by `path_provider_android` is
+  # ABI-compatible with the surface the app exercises.
+  jni_flutter: ^1.0.2
+
+# Vendored fork of flutter_secure_storage_linux 3.0.1 (see
+# packages/flutter_secure_storage_linux/CHANGELOG.md): upstream builds the
+# libsecret schema name from a std::string buffer that setLabel() invalidates,
+# so with long application ids every keyring item is stored with a garbage
+# xdg:schema attribute and sessions cannot survive a restart. Remove once an
+# upstream release ships the fix.
+dependency_overrides:
+  flutter_secure_storage_linux:
+    path: packages/flutter_secure_storage_linux
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  fake_async: ^1.3.3
+  path_provider_platform_interface: ^2.1.2
+  share_plus_platform_interface: ^7.2.0
+  url_launcher_platform_interface: ^2.3.2
+  flutter_lints: ^6.0.0
+  build_runner: ^2.16.2
+  drift_dev: ^2.35.1
+  freezed: ^4.0.3
+  json_serializable: ^6.14.0
+  riverpod_generator: ^4.0.9
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  generate: true
+  uses-material-design: true
+  assets:
+    - assets/logo-light.svg
+    - assets/discover/recommended_channels.json
+    # Aurora text faces (ADR-0089), bundled in the google_fonts asset layout so
+    # the first theme build loads them from the bundle instead of fetching
+    # fonts.gstatic.com (FOUT + full-app relayout + wrong fonts offline).
+    # Only the weights/styles the app requests ship; CJK Noto SC/Kr/Jp variant
+    # fallbacks stay on-demand runtime fetches (~40 MB, platform fonts cover
+    # offline). OFL-*.txt carry each family's license.
+    - assets/fonts/google_fonts/
+    # Vendored eSpeak-NG voices/dicts; extracted to disk on Android at startup
+    # (espeak_android_provisioner) because eSpeak fopens real files.
+    # Flutter does not recurse: each directory needs its own entry or `lang/`
+    # is omitted and espeak_SetVoiceByName(en-us) fails on Android.
+    - packages/forced_alignment/native/espeak-ng-data/
+    - packages/forced_alignment/native/espeak-ng-data/lang/
+
+  # Aurora icon family — Phosphor Icons (MIT), vendored so the icon set does
+  # not depend on a package whose IconData subclass breaks on new Flutter
+  # releases. Only the three weights the UI uses ship. See ADR-0089.
+  fonts:
+    # Duet text faces (ADR-0095), declared as real multi-weight families so a
+    # `fontWeight` change selects the matching face instead of keeping the
+    # variant a google_fonts family name was built for.
+    - family: Geist
+      fonts:
+        - asset: assets/fonts/google_fonts/Geist-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/google_fonts/Geist-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/google_fonts/Geist-SemiBold.ttf
+          weight: 600
+    - family: GeistMono
+      fonts:
+        - asset: assets/fonts/google_fonts/GeistMono-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/google_fonts/GeistMono-SemiBold.ttf
+          weight: 600
+    - family: Literata
+      fonts:
+        - asset: assets/fonts/google_fonts/Literata-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/google_fonts/Literata-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/google_fonts/Literata-SemiBold.ttf
+          weight: 600
+    - family: NotoSans
+      fonts:
+        - asset: assets/fonts/google_fonts/NotoSans-Regular.ttf
+          weight: 400
+    - family: PhosphorRegular
+      fonts:
+        - asset: assets/fonts/phosphor/Phosphor-Regular.ttf
+    - family: PhosphorFill
+      fonts:
+        - asset: assets/fonts/phosphor/Phosphor-Fill.ttf
+    - family: PhosphorBold
+      fonts:
+        - asset: assets/fonts/phosphor/Phosphor-Bold.ttf
+

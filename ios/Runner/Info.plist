@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- PostHog: manual init only (specs/046) — the Dart side configures
+	     Posthog() from --dart-define values so a tokenless/debug build is
+	     fully inert. -->
+	<key>com.posthog.posthog.AUTO_INIT</key>
+	<false/>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Enjoy Player</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Enjoy Player</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>flutter</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Enjoy Player uses the microphone for shadow-reading practice recordings.</string>
+	<!-- Required by App Store Connect even when camera is only referenced via
+	     dependencies (e.g. file_picker); the app may offer capture when picking
+	     a profile photo or media on device. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Enjoy Player may use the camera when you choose to take a photo for your profile avatar or to import media for learning.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Enjoy Player accesses your photo library when you choose an image for your profile avatar or import media for learning.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<!-- `app_links` (AuthDeepLinkListener) owns enjoyplayer:// callbacks.
+	     Flutter's own deep-link auto-forwarding would otherwise also push
+	     the raw URI onto go_router as an initial route, which has no
+	     matching path and briefly renders the "not found" screen while the
+	     token exchange completes in the background. -->
+	<key>FlutterDeepLinkingEnabled</key>
+	<false/>
+	<!--
+	  TODO(google-oauth): GIDClientID must be a real iOS-type OAuth client ID
+	  created in Google Cloud Console for bundle ID ai.enjoy.player, matching
+	  `google.ios_client_id` in enjoy_web's Rails credentials. The second
+	  CFBundleURLSchemes entry below must be that client ID reversed, e.g.
+	  "com.googleusercontent.apps.<CLIENT_ID_PREFIX>" (see
+	  https://developers.google.com/identity/sign-in/ios/start-integrating).
+	  The placeholder below uses hyphens (not underscores) so it still
+	  satisfies Apple's URL-scheme format check (RFC1738: alphanumeric,
+	  period, hyphen, plus only) — underscores fail `flutter build ipa`
+	  export with "URL schemes ... not in the correct format".
+	-->
+	<key>GIDClientID</key>
+	<string>93185289922-ostq1e99j92mq3l5dokeb904rgetkcvu.apps.googleusercontent.com</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>ai.enjoy.player.auth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>enjoyplayer</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>ai.enjoy.player.google-signin</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.93185289922-ostq1e99j92mq3l5dokeb904rgetkcvu</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

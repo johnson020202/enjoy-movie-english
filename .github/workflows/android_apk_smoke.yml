@@ -1,0 +1,247 @@
+name: Android APK smoke
+
+on:
+  # PRs build only when native, dependency or build-tooling inputs change;
+  # Dart-only changes are covered by CI (analyze + tests) on the PR and by
+  # this build on the push to main. Run it on a PR branch on demand with:
+  #   gh workflow run android_apk_smoke.yml --ref <branch>
+  pull_request:
+    paths:
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "android/**"
+      - "tool/patch_agp9_pub_plugins.sh"
+      - "tool/prefetch_media_kit_android_libs.sh"
+      - "tool/prefetch_sqlite3_libs.sh"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/actions/setup-android/**"
+      - ".github/scripts/ensure_linux_tooling.sh"
+      - ".github/workflows/android_apk_smoke.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "lib/**"
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "analysis_options.yaml"
+      - "android/**"
+      - "tool/patch_agp9_pub_plugins.sh"
+      - "tool/prefetch_media_kit_android_libs.sh"
+      - "tool/prefetch_sqlite3_libs.sh"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/actions/setup-android/**"
+      - ".github/scripts/ensure_linux_tooling.sh"
+      - ".github/workflows/android_apk_smoke.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Cache misses must not reach pub.dev / storage.googleapis.com through the
+# per-GB proxy; these mirrors are routed DIRECT. pubspec.lock pins every
+# package by sha256, so a mirror serving different bytes fails the hash check.
+env:
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+  # This runner sits behind a network where dl.google.com resets the TLS
+  # handshake, so Gradle resolves Google Maven artifacts through the Aliyun
+  # mirror (see android/settings.gradle.kts).
+  ENABLE_MAVEN_MIRROR: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, Linux]
+    # Successful runs land in 11–23 min once the engine artifacts come from
+    # the cache; the first run after a Flutter bump also fetches ~520 MB of
+    # them, and 60 min absorbs the setup-android retry backoff without
+    # letting a hung dl.google.com fetch hold the runner forever
+    # (self-hosted jobs have no default timeout). The engine prefetch bounds
+    # its own transfers, so a stalled mirror cannot outlive the job either.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      # Resolve the cache keys once, before `flutter pub get` rewrites
+      # pubspec.lock against the mirror — the hashes must describe the same
+      # lockfile for the restore and for the save. The Flutter version is part
+      # of the Gradle key because the engine's dependency set (the androidx
+      # versions it pins, among others) follows it: without it a Flutter bump
+      # would leave the cache key unchanged, the save would stay skipped, and
+      # every artifact the build downloaded would be fetched again on every
+      # run — from mirrors whose TLS handshake the runner network resets.
+      - name: Resolve cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^[[:space:]]*flutter[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' mise.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the flutter pin from mise.toml ([tools] flutter = \"...\")"
+            exit 1
+          fi
+          echo "flutter=$version" >> "$GITHUB_OUTPUT"
+          echo "pub=pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}" >> "$GITHUB_OUTPUT"
+          echo "gradle=gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties') }}-${{ hashFiles('**/pubspec.lock') }}-$version" >> "$GITHUB_OUTPUT"
+
+      # The job's inner environment is reset to a pristine state before each
+      # run, so ~/.pub-cache cannot persist on the runner between jobs. The
+      # cache backend is the LAN gh-sr-cache server: a hit costs zero proxy
+      # bytes, and only a miss re-uploads.
+      - name: Restore pub cache
+        id: pub-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: ${{ steps.cache-keys.outputs.pub }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      # The prefetched Flutter engine artifacts are a function of the Flutter
+      # version alone, so they get their own cache entry instead of riding
+      # along with the Gradle module cache.
+      - name: Restore prefetched Flutter engine artifacts
+        id: engine-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/flutter-engine-maven
+          key: flutter-engine-${{ runner.os }}-${{ steps.cache-keys.outputs.flutter }}
+
+      # Deliberately not the whole ~/.gradle/caches: on this project that tree
+      # is ~6.1 GB, of which caches/9.1.0 alone is ~3.8 GB of path-keyed,
+      # per-version script/plugin caches that are regenerated every build and
+      # are not safe to replay onto a different workspace path. Only the two
+      # genuinely downloaded halves are cached — the Gradle distribution
+      # (~740 MB, refetched whenever the env resets) and modules-2 (~1.6 GB of
+      # AAR/JAR artifacts) — which keeps the job under the 10 GB repo cache
+      # limit even alongside the pub cache.
+      - name: Restore Gradle distribution and dependency caches
+        id: gradle-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/wrapper/dists
+            ~/.gradle/caches/modules-2
+          key: ${{ steps.cache-keys.outputs.gradle }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties') }}-
+            gradle-${{ runner.os }}-
+
+      - name: Ensure Linux tooling
+        run: bash .github/scripts/ensure_linux_tooling.sh --skip-wpe
+
+      - uses: ./.github/actions/setup-java
+
+      - uses: ./.github/actions/setup-flutter
+
+      - uses: ./.github/actions/setup-android
+        with:
+          packages: >-
+            platforms;android-36
+            build-tools;36.0.0
+
+      - name: Point Flutter at Android SDK
+        run: |
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$sdk" ]; then echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME not set"; exit 1; fi
+          flutter config --android-sdk "$sdk"
+
+      - name: Flutter pub get
+        run: |
+          flutter pub get
+          bash tool/patch_agp9_pub_plugins.sh
+
+      - name: Prefetch media_kit Android native libs
+        run: bash tool/prefetch_media_kit_android_libs.sh
+
+      # The sqlite3 build hook downloads libsqlite3.so from GitHub Releases
+      # with no retries; a blip there kills the whole gradle build
+      # ("Target dart_build failed"). Prefetch like release_android.sh does.
+      - name: Prefetch sqlite3 Android native libs
+        run: bash tool/prefetch_sqlite3_libs.sh
+
+      # The Flutter Gradle plugin pulls the engine artifacts (the embedding
+      # plus one libflutter.so jar per ABI, ~520 MB) from the mirror with no
+      # retry. The mirror resets the TLS handshake often enough to fail whole
+      # builds, so fetch them here — with retries and Range resume — and let
+      # Gradle resolve them from the local Maven repository this produces.
+      - name: Prefetch Flutter engine Android artifacts
+        run: bash tool/prefetch_flutter_engine_android_libs.sh
+
+      - name: Flutter build apk (debug)
+        run: flutter build apk --debug --flavor store
+
+      - name: Assert eSpeak-NG artifacts in debug APK
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-store-debug.apk"
+          listing="$(unzip -l "$apk")"
+          # Here-string, not `echo | grep -q`: grep -q closes early and
+          # `set -o pipefail` then treats SIGPIPE as a missing-file failure.
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            grep -F -q -- "lib/$abi/libespeak-ng.so" <<<"$listing" || {
+              echo "::error::lib/$abi/libespeak-ng.so missing from $apk"; exit 1; }
+          done
+          grep -F -q -- "flutter_assets/packages/forced_alignment/native/espeak-ng-data/phontab" <<<"$listing" || {
+            echo "::error::espeak-ng-data assets missing from $apk"; exit 1; }
+          grep -F -q -- "flutter_assets/packages/forced_alignment/native/espeak-ng-data/lang/en-us" <<<"$listing" || {
+            echo "::error::espeak-ng-data/lang/en-us missing from $apk (SetVoiceByName will fail)"; exit 1; }
+
+      - name: Flutter build apk (release, compile-only, split per ABI)
+        run: flutter build apk --release --split-per-abi --flavor direct --dart-define=DISTRIBUTION_CHANNEL=direct
+
+      - name: Assert eSpeak-NG artifacts in split-per-abi release APK
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-arm64-v8a-direct-release.apk"
+          listing="$(unzip -l "$apk")"
+          grep -F -q -- "lib/arm64-v8a/libespeak-ng.so" <<<"$listing" || {
+            echo "::error::libespeak-ng.so missing from $apk"; exit 1; }
+          grep -F -q -- "flutter_assets/packages/forced_alignment/native/espeak-ng-data/phontab" <<<"$listing" || {
+            echo "::error::espeak-ng-data assets missing from $apk"; exit 1; }
+          grep -F -q -- "flutter_assets/packages/forced_alignment/native/espeak-ng-data/lang/en-us" <<<"$listing" || {
+            echo "::error::espeak-ng-data/lang/en-us missing from $apk (SetVoiceByName will fail)"; exit 1; }
+
+      - name: Flutter build appbundle (release, compile-only)
+        run: flutter build appbundle --release --flavor store
+
+      # The saves run last, after the build has populated the stores. Saving
+      # before the build captured only the restored snapshot, so everything the
+      # build downloaded was discarded and re-fetched on every run — the
+      # engine artifacts alone are ~520 MB, fetched from a mirror whose TLS
+      # handshake the runner network resets often enough to fail the build.
+      # Each save targets the primary key: an exact hit skips it, and a
+      # prefix restore writes the primary key so the next run hits exactly.
+      - name: Save pub cache
+        if: steps.pub-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: ${{ steps.cache-keys.outputs.pub }}
+
+      - name: Save prefetched Flutter engine artifacts
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/flutter-engine-maven
+          key: flutter-engine-${{ runner.os }}-${{ steps.cache-keys.outputs.flutter }}
+
+      - name: Save Gradle caches
+        if: steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/wrapper/dists
+            ~/.gradle/caches/modules-2
+          key: ${{ steps.cache-keys.outputs.gradle }}

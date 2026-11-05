@@ -1,0 +1,116 @@
+import 'package:enjoy_player/data/db/settings_keys.dart';
+import 'package:enjoy_player/features/hotkeys/domain/hotkey_definition.dart';
+import 'package:enjoy_player/features/hotkeys/domain/hotkey_definitions.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  group('hotkey_definitions', () {
+    test('every definition has a non-empty id and defaultKeys', () {
+      expect(hotkeyDefinitions, isNotEmpty);
+      for (final d in hotkeyDefinitions) {
+        expect(d.id, isNotEmpty, reason: 'definition has blank id');
+        expect(
+          d.defaultKeys,
+          isNotEmpty,
+          reason: '$d.id has blank defaultKeys',
+        );
+        expect(
+          d.descriptionKey,
+          isNotEmpty,
+          reason: '$d.id has blank descriptionKey',
+        );
+        expect(
+          d.description == null || d.description!.isNotEmpty,
+          isTrue,
+          reason: '$d.id has blank description override',
+        );
+      }
+    });
+
+    test('ids are unique across the catalogue', () {
+      final seen = <String>{};
+      for (final d in hotkeyDefinitions) {
+        expect(seen.add(d.id), isTrue, reason: 'duplicate id: ${d.id}');
+      }
+      expect(seen.length, hotkeyDefinitions.length);
+    });
+
+    test('descriptionKeys are unique within each scope', () {
+      final byScope = <HotkeyScope, List<String>>{};
+      for (final d in hotkeyDefinitions) {
+        byScope.putIfAbsent(d.scope, () => []).add(d.descriptionKey);
+      }
+      for (final entry in byScope.entries) {
+        final seen = <String>{};
+        for (final key in entry.value) {
+          expect(
+            seen.add(key),
+            isTrue,
+            reason: 'duplicate descriptionKey "$key" in ${entry.key.name}',
+          );
+        }
+        expect(seen.length, entry.value.length);
+      }
+    });
+
+    test('the four echo expand/shrink defaults use useKey=true', () {
+      const echoKeys = {
+        'player.expandEchoBackward',
+        'player.expandEchoForward',
+        'player.shrinkEchoBackward',
+        'player.shrinkEchoForward',
+      };
+      for (final id in echoKeys) {
+        final def = hotkeyDefinitionMap[id];
+        expect(def, isNotNull, reason: 'missing definition: $id');
+        expect(
+          def!.useKey,
+          isTrue,
+          reason: 'echo defaults must use KeyPicker: $id',
+        );
+      }
+    });
+
+    test('modal.close is non-customizable and bound to escape', () {
+      final def = hotkeyDefinitionMap['modal.close'];
+      expect(def, isNotNull);
+      expect(def!.defaultKeys, 'escape');
+      expect(def.customizable, isFalse);
+      expect(def.scope, HotkeyScope.modal);
+    });
+
+    test('hotkeyDefinitionMap exposes every definition', () {
+      expect(hotkeyDefinitionMap.length, hotkeyDefinitions.length);
+      for (final d in hotkeyDefinitions) {
+        expect(
+          hotkeyDefinitionMap[d.id],
+          same(d),
+          reason: 'hotkeyDefinitionMap missing ${d.id}',
+        );
+      }
+    });
+
+    test('hotkeysByScope returns only that scope and stays in order', () {
+      for (final scope in HotkeyScope.values) {
+        final picked = hotkeysByScope(scope);
+        for (final def in picked) {
+          expect(
+            def.scope,
+            scope,
+            reason: '${def.id} does not belong to ${scope.name}',
+          );
+        }
+        final expected = hotkeyDefinitions.where((d) => d.scope == scope);
+        expect(picked, equals(expected));
+      }
+    });
+
+    test('hotkeys custom-bindings key keeps its storage name', () {
+      expect(SettingsKeys.hotkeysCustomBindings.name, isNotEmpty);
+      expect(
+        SettingsKeys.hotkeysCustomBindings.name,
+        'hotkeys_custom_bindings',
+      );
+    });
+  });
+}

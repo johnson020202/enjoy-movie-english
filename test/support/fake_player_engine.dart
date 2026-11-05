@@ -1,0 +1,271 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:media_kit/media_kit.dart' as mk;
+
+import 'package:enjoy_player/features/player/domain/playable_source.dart';
+import 'package:enjoy_player/features/player/application/player_engine.dart';
+import 'package:enjoy_player/features/player/application/player_engine_capabilities.dart';
+
+/// Test double with controllable streams, shaped like [MediaKitPlayerEngine]:
+/// frame capture + embedded-subtitle control, **no** metadata capability
+/// ([PlayerEngine.metadata] is `null`) and not a [YoutubePlaybackEngine]
+/// (issue #720 — fakes model one honest engine flavor each).
+///
+/// For the YouTube flavor use [FakeYoutubeEngine].
+class FakePlayerEngine
+    implements PlayerEngine, PosterCapture, SubtitleTrackControl {
+  FakePlayerEngine();
+
+  @override
+  PlayerEngineMetadata? get metadata => null;
+
+  final StreamController<Duration> _position =
+      StreamController<Duration>.broadcast();
+  final StreamController<Duration> _duration =
+      StreamController<Duration>.broadcast();
+  final StreamController<bool> _playing = StreamController<bool>.broadcast();
+  final StreamController<bool> _buffering = StreamController<bool>.broadcast();
+  final StreamController<void> _completed = StreamController<void>.broadcast();
+
+  final List<String> openUris = <String>[];
+  final List<Duration> seekCalls = <Duration>[];
+  int screenshotCalls = 0;
+  int pauseCallCount = 0;
+
+  /// When set, the next [seek] awaits this completer before resolving — used to
+  /// hold an echo enforcement op in flight so tests can observe single-flight
+  /// serialization. Captured and cleared on the first awaiting [seek], so the
+  /// test completes its own [Completer] reference to release it.
+  Completer<void>? seekGate;
+
+  Uint8List? screenshotReturnValue;
+
+  Future<void> Function()? openDelay;
+
+  /// Completes the first time [open] is entered. Tests waiting for the
+  /// coordinator to reach the engine must await this instead of polling:
+  /// the open path performs real file IO before this point, so a bounded
+  /// zero-duration-timer poll can starve on a loaded CI runner.
+  final Completer<void> openEntered = Completer<void>();
+
+  double lastVolume = -1;
+  double lastRate = -1;
+
+  void emitPosition(Duration d) {
+    if (!_position.isClosed) _position.add(d);
+  }
+
+  void emitDuration(Duration d) {
+    if (!_duration.isClosed) _duration.add(d);
+  }
+
+  /// Simulates a buffering transition (used by post-open readiness gates).
+  void emitBuffering(bool value) {
+    if (!_buffering.isClosed) _buffering.add(value);
+  }
+
+  /// Simulates end-of-media (fires the [completed] stream once).
+  void emitCompleted() {
+    if (!_completed.isClosed) _completed.add(null);
+  }
+
+  @override
+  Stream<Duration> get position => _position.stream;
+
+  @override
+  Stream<Duration> get duration => _duration.stream;
+
+  @override
+  Stream<bool> get playing => _playing.stream;
+
+  @override
+  Stream<bool> get buffering => _buffering.stream;
+
+  @override
+  Stream<void> get completed => _completed.stream;
+
+  bool supportsVideoPosterCaptureValue = true;
+
+  @override
+  bool get supportsVideoPosterCapture => supportsVideoPosterCaptureValue;
+
+  @override
+  bool get supportsSubtitleDisabling => true;
+
+  /// The fake has no media_kit player behind it — no embedded track list.
+  @override
+  Stream<mk.Tracks>? get mkTracksStream => null;
+
+  @override
+  Future<void> awaitSurfaceReady() async {}
+
+  /// When set, [awaitSurfaceDetached] waits on this completer.
+  Completer<void>? surfaceDetachGate;
+
+  @override
+  Future<void> awaitSurfaceDetached() async {
+    final gate = surfaceDetachGate;
+    if (gate != null) await gate.future;
+  }
+
+  @override
+  void prepareNativeBackend() {}
+
+  int resetCompletionFlagCallCount = 0;
+
+  @override
+  void resetCompletionFlag() {
+    resetCompletionFlagCallCount++;
+  }
+
+  int teardownAfterClearCallCount = 0;
+  bool? lastTeardownKeepSurfaceMounted;
+
+  @override
+  Future<void> teardownAfterClear({required bool keepSurfaceMounted}) async {
+    teardownAfterClearCallCount++;
+    lastTeardownKeepSurfaceMounted = keepSurfaceMounted;
+    await stop();
+  }
+
+  @override
+  bool get keepSurfaceWhenParked => true;
+
+  @override
+  ({bool playing, bool buffering}) get transportSnapshot =>
+      (playing: false, buffering: false);
+
+  void _recordUriFromSource(PlayableSource source) {
+    switch (source) {
+      case LocalFilePlayableSource(:final uri):
+        openUris.add(uri);
+      case RemoteUrlPlayableSource(:final uri):
+        openUris.add(uri);
+      case YoutubePlayableSource(:final videoId):
+        openUris.add('youtube:$videoId');
+    }
+  }
+
+  @override
+  Future<void> open(PlayableSource source) async {
+    _recordUriFromSource(source);
+    if (!openEntered.isCompleted) openEntered.complete();
+    final delay = openDelay;
+    if (delay != null) await delay();
+  }
+
+  @override
+  Future<void> disableRenderedSubtitles() async {}
+
+  @override
+  Future<void> seek(Duration target) async {
+    seekCalls.add(target);
+    final gate = seekGate;
+    if (gate != null) {
+      seekGate = null;
+      await gate.future;
+    }
+  }
+
+  @override
+  Future<void> setRate(double rate) async {
+    lastRate = rate;
+  }
+
+  @override
+  Future<void> setVolumeNormalized(double volume) async {
+    lastVolume = volume;
+  }
+
+  int playOrPauseCallCount = 0;
+
+  @override
+  Future<void> playOrPause() async {
+    playOrPauseCallCount++;
+  }
+
+  int playCallCount = 0;
+
+  @override
+  Future<void> play() async {
+    playCallCount++;
+  }
+
+  @override
+  Future<void> pause() async {
+    pauseCallCount++;
+  }
+
+  @override
+  Future<void> stop() async {
+    stopCallCount++;
+  }
+
+  int stopCallCount = 0;
+
+  @override
+  Future<Uint8List?> screenshot({String? format}) async {
+    screenshotCalls++;
+    return screenshotReturnValue;
+  }
+
+  int warmVideoSurfaceCallCount = 0;
+
+  @override
+  void warmVideoSurface() {
+    warmVideoSurfaceCallCount++;
+  }
+
+  /// When set, [dispose] waits on this completer before closing streams.
+  Completer<void>? disposeGate;
+
+  int disposeCallCount = 0;
+
+  @override
+  Future<void> dispose() async {
+    disposeCallCount++;
+    final gate = disposeGate;
+    if (gate != null) await gate.future;
+    await _position.close();
+    await _duration.close();
+    await _playing.close();
+    await _buffering.close();
+    await _completed.close();
+  }
+}
+
+/// YouTube-flavored test double (issue #720): implements
+/// [PlayerEngineMetadata] and the [YoutubePlaybackEngine] marker like
+/// [YoutubePlayerEngine] does, and inherits the transport + swap-lifecycle
+/// recording surface from [FakePlayerEngine]. Frame capture / embedded
+/// subtitle control are *not* overridden away here because the base fake
+/// implements them — tests that need "YouTube cannot capture" assert on the
+/// production [YoutubePlayerEngine] instead.
+class FakeYoutubeEngine extends FakePlayerEngine
+    implements PlayerEngineMetadata, YoutubePlaybackEngine {
+  @override
+  PlayerEngineMetadata get metadata => this;
+
+  String? posterUrlValue;
+
+  @override
+  String? get posterUrl => posterUrlValue;
+
+  @override
+  void setPosterUrl(String? url) {
+    posterUrlValue = url;
+  }
+
+  String currentVideoIdValue = '';
+
+  @override
+  String get currentVideoId => currentVideoIdValue;
+
+  int markOpenTimingStartCallCount = 0;
+
+  @override
+  void markOpenTimingStart() {
+    markOpenTimingStartCallCount++;
+  }
+}

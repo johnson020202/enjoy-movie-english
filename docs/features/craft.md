@@ -1,0 +1,318 @@
+# Craft from Text
+
+## Summary
+
+**Craft** helps language learners build a personal library of shadow-reading audio by turning spoken or typed thoughts into idiomatic target-language audio. Generated items are regular library media (`provider = 'craft'`) — they support echo mode, transcripts, library browsing, and cloud sync without special wiring.
+
+Craft ships two modes (see [ADR-0060](../decisions/0060-craft-voice-express-dual-mode.md)):
+
+| Mode | Entry | What it does | When to use |
+|------|-------|-------------|-------------|
+| **Express** (default) | Speak a thought | Voice-first linear flow: speak → ASR → AI rewrite → TTS → save/loop | You want to capture spontaneous thoughts fast |
+| **Advanced** | Paste / type text | Two-tool layout: Translate panel + Synthesize panel | You already have prepared text |
+
+Craft is a top-level page (the `Craft` / `PhCraft` boards): an `EditorialHeader` with the `craftOverline` eyebrow and Literata title, and the mode `EnjoySegmentedControl<CraftScreenMode>` (the Duet sliding-thumb primitive from [ADR-0093](../decisions/0093-duet-design-language.md), `craftModeExpress` / `craftModeAdvanced` labels) plus a **History** button on the header row — beside the title on wide panes, under it below the compact breakpoint (History becomes an icon button there). Express adds a **Capture → Rewrite → Audio** stepper (`CraftStageStepper`, driven by `CraftJobState.stage`) and renders its stages inside one paper card; the capture card caps at 460 px and hugs the top. The idle capture view reads mic → Literata prompt → subtitle → source/target **endonym** chips (`languageEndonymLabel`, e.g. `中文 → English`) → Type instead; the recording view uses the you-violet voice (timer, pulse, stop), never the danger red. Switching modes still routes through `_changeMode`, so unsaved in-memory TTS previews are confirmed before being discarded.
+
+## Visual language
+
+Craft's presentation layer follows [ADR-0093](../decisions/0093-duet-design-language.md) — same primitives as the already-migrated player, home, and settings surfaces:
+
+| Concern | Primitive |
+|---------|-----------|
+| Mode switcher | `EnjoySegmentedControl` (sliding thumb, no Material `SegmentedButton`) |
+| Header actions | Mode segmented + `EnjoyButton.secondary` History (icon button below the compact breakpoint) |
+| Surfaces | `EnjoyCard`; hand-rolled surfaces use `ShapeDecoration` + `RoundedSuperellipseBorder` / `ClipRSuperellipse` |
+| Buttons | `EnjoyButton.primary` / `.secondary` / `.ghost` / `.destructive`, `EnjoyIconButton` |
+| Tappables | `EnjoyPressable` — no `InkWell` / `Material` ink islands (ADR-0089 §6) |
+| Section titles | `EnjoySectionHeader` inside tool panels |
+| Grouped list | `EnjoyCard` + `SettingsRow` / `SettingsRowDivider` / `EnjoyIconTile` (history screen) |
+| Empty state | `EmptyState` / `EnjoyIconOrb` |
+| Progress | `LoadingIcon` instead of bare `CircularProgressIndicator` |
+| Numerals | `enjoyMonoStyle` (Geist Mono) for language codes and durations — never `fontFamily: 'monospace'` |
+| Color | `EnjoyThemeTokens.of(context)` role tokens only (`fill`, `hairline`, `accentInk`, `textFaint`, `scoreBad`, …) — no `Color(0x…)` literals |
+
+Dialog action rows keep the repo-wide `TextButton` idiom inside `showEnjoyAlertDialog`, matching already-migrated dialogs.
+
+## Navigation
+
+Craft is a first-class entry point (see [ADR-0061](../decisions/0061-craft-first-class-history.md)), reachable from three places:
+
+- **Home header** — an `OutlinedButton.icon` labelled `homeCraftAction` sits before the `Import` button in both `EditorialHeader` trailing sites on Home (loaded and loading/skeleton states share a `_HomeHeaderActions` widget) → `/craft`.
+- **Global hotkey** — `c` (`global.craft` in `hotkey_definitions.dart`, scope `global`, customizable) opens Craft from anywhere except webview-owned routes — `/player/*` and `/youtube/*` (`GlobalCraftHotkeyCommand` gates there so bare `c` reaches in-webview text entry such as the YouTube login form, which never becomes Flutter's primary focus). No-op when already on `/craft` or a `/craft/*` route.
+- **Import chooser** → **Craft from text…** → `/craft` (original entry point, retained).
+
+Flows as a full-screen route; back returns to wherever the user came from.
+
+**Branding**: "Craft" is kept as an untranslated brand term in the Chinese locale (`craftScreenTitle` / `homeCraftAction` both render `"Craft"` in `app_zh.arb`), matching the existing `importCraftFromText` → `"Craft…"` convention — it is not translated to a Chinese word.
+
+### Remembered preferences
+
+Craft choices persist across sessions so learners don't re-pick them every time. `CraftPreferencesCtrl` (keepAlive, per-user) stores a JSON blob under the Drift settings key `craft.preferences_v1` (`SettingsKeys.craftPreferencesV1`):
+
+| Persisted | Notes |
+|-----------|-------|
+| Last screen mode | Express / Advanced — reopening Craft restores it |
+| Translation style **per mode** | `expressStyle` (first-run default `auto`) and `advancedStyle` (first-run default `natural`) |
+| Custom prompt | Remembered alongside the style it belongs to |
+| Voice **per base language** | Map like `{'en': 'en-US-GuyNeural'}`; entries validate against `kAzureVoices` on load and are dropped if the catalog changed |
+
+Deliberately **not** persisted: the language pair. It always re-seeds from the learner's profile settings on entry — `CraftController.build()` reads `AppPreferencesCtrl.effectiveNativeLanguage` / `effectiveLearningLanguage` synchronously (so the Express idle pill never renders the `—` placeholder), and the lazy per-widget seeding that used to live in `CaptureStage._startRecording` / `TranslateTool.initState` is gone.
+
+Sign-in semantics mirror `AppPreferencesCtrl`: the blob lives in the per-user DB, so reads/writes are skipped while signed out (translate still works; choices are session-only). `CraftController` setters write through to the prefs controller but never persist on programmatic restores — `loadForEdit` prefills an item's own values via `copyWith` and does not touch the blob. A late hydration never clobbers user input: every user-intent setter latches `prefsHydrationMutated` (the guard on `CraftControllerCore`), and hydration is skipped while an edit-from-history restore is in flight.
+
+### Craft history (`/craft/history`)
+
+An `EnjoyIconButton` history action (tooltip `craftHistoryTooltip`) in the Craft app bar opens `CraftHistoryScreen`, which lists every media item where `Audios.provider == 'craft'`, newest-updated first (`craftHistoryProvider` — a thin `StreamProvider` over `mediaRegistryProvider.watchAll()`, no new query or schema). Rows render as a **grouped inset list**: one `EnjoyCard` with a `SettingsRow` per item (`EnjoyIconTile` sparkle leading icon, title, localized date subtitle, destructive `EnjoyIconButton` remove affordance) under a single `EnjoySectionHeader` titled `craftHistoryTitle` with the item count as its caption, matching the Settings / Profile rhythm. Empty state uses `craftHistoryEmptyTitle` / `craftHistoryEmptyHint` / `craftHistoryEmptyAction` in an `EmptyState`.
+
+Each row can **Remove Craft record** (`CraftLibraryRepository.removeCraftHistoryRecord`): clears Craft provenance by setting `Audios.provider` from `'craft'` to `'user'`. The same media id, audio file, and transcript stay in the library for practice (no Craft badge). This is not a library delete and not a soft-hide list. If the removed item is the active edit session (`editingMediaId`), the controller resets via `resetForNextCapture`.
+
+### Edit an existing Craft item
+
+Tapping a history item calls `CraftController.loadForEdit(mediaId)`:
+
+- Loads a `CraftEditSource` snapshot (`lib/features/craft/domain/craft_edit_source.dart`) via `CraftLibraryRepository.getCraftEditSource` — returns `null` (surfaced as `craftEditUnavailable`) if the item no longer exists.
+- Prefills **Express** mode (stage `rewrite`) when the item's `sourceFlag == 'craft-express'` and it has a native-language transcript; otherwise prefills **Advanced** mode with the reconstructed practice text loaded into the Synthesize tool.
+- Sets `CraftJobState.editingMediaId`, which routes the next `saveToLibrary` call to `CraftLibraryRepository.updateCraftedFromText` (update the same media id, replacing audio + primary transcript) instead of `CraftLibraryRepository.importCraftedFromText` — editing never creates a duplicate library entry. `editingMediaId` is cleared by `setScreenMode` and `resetForNextCapture`.
+
+## Express mode
+
+A linear three-stage pipeline (`CraftStage` enum: `capture` → `rewrite` → `audio`) orchestrated by `ExpressFlow`. The core product insight: **learners can't speak fluently because they don't have enough to say** — so the default flow starts from the user's own voice, not prepared text.
+
+### Capture stage (`CaptureStage`)
+
+- Large mic button (72px phone / 88px tablet+); tap to start, tap red stop button to finish. Both are `EnjoyPressable` over the `shadow_record_fab` lit-fill idiom (`enjoyLitFillDecoration` + `enjoyLitShadow`), with a soft radial halo — no ink ripple
+- The `source → target` language pair reads as a mono pill above the title (`enjoyMonoStyle`, `fill` + `hairline` surface)
+- Live waveform animation (`accentInk` bars) + a mono recording timer in `scoreBad`-equivalent error red while recording
+- **Cancel** — discards the take without ASR (`CraftController.cancelCapture()`); also wired to Escape (cancel in place, same priority as shadow-reading cancel) and route leave / back (clears `isCapturing` so reopen cannot stick on a dead Stop UI)
+- **Text fallback** — a ghost "type instead" button replaces the mic with a `TextField` (skips ASR), plus an `EnjoyButton.primary` submit
+- `AudioRecorder` is owned by the widget (not the controller), recreated after each stop — mirrors the `ShadowReadingPanel` pattern (16kHz mono WAV)
+- On stop, `CraftController.stopCapture(bytes)` stores the bytes and `transcribeAndRewrite()` runs ASR (`CraftTranscriber`) → guarded empty-transcript check → LLM rewrite (`CraftTranslator`) → advances to the rewrite stage
+
+### Rewrite stage (`RewriteStage`)
+
+- **Editable native transcript card** (labelled "Your words") — an `EnjoyCard` with a quote glyph header, a hairline Re-translate action, and a recessed `TextField` so learners can correct recognition errors; edits write to `rawTranscript` (+ synced `sourceText`). When the native text differs from the last successful rewrite input (`isRawTranscriptDirty`), a **Re-translate** action appears on the card (`craftReTranslateButton`)
+- **Editable target text card** (labelled "In [target]…") — a mono `accentInk`/`accentSoft` language badge plus `TextEditingController` synced to `state.translatedText` only when the field is not focused, so user edits are preserved across regenerations; field is height-capped (`maxLines: 10`) to avoid layout overflow
+- **Options panel** — an `EnjoyCard` holding the always-visible `StylePicker` + Azure Neural `VoicePicker`, split by a hairline divider; style starts from the remembered Express style (**Auto** on first run); voice from the remembered per-language pick, falling back via `defaultVoiceForLanguage` when unset
+- Re-translate / Regenerate keep the form visible with inline progress when a target already exists (full-screen "Crafting…" spinner only for the first rewrite)
+- Three action buttons (all `EnjoyButton`):
+  - **Regenerate** → `controller.regenerate()` — re-runs the LLM rewrite on the current native transcript with the current style (same path as Re-translate; no-op if below `craftMinTextLength`)
+  - **Re-record** → `controller.resetForNextCapture()` — back to the capture stage
+  - **Generate audio** → `controller.generateAudio()` — synthesizes with `selectedVoice` and advances to the audio stage
+
+### "Auto" translation style
+
+A new `TranslationStyle.auto` is the **default** for Express mode. Instead of a literal translation, the system prompt (defined in `CraftTranslationServiceTranslator._autoStylePrompt()`) instructs the LLM to act as a **language partner** — reading the user's spontaneous thought, understanding their intent and personal style, and rewriting it idiomatically in the target language as a fluent speaker would naturally say it. The prompt is distinct from all other style prompts (literal, natural, casual, etc.).
+
+`auto.promptSuffix` returns an empty string (the full prompt is assembled by the translator) and `showsCustomPrompt` returns false (no custom-prompt field is shown when Auto is selected).
+
+### Audio stage (`AudioStage`)
+
+- **Script block** — a `fill` + `hairline` superellipse card with a mono `accentInk` language pair and an `accentInk` left rail, wrapping the full learning-language text (selectable) so the learner can follow along while previewing. Long scripts scroll inside a capped viewport (~240px) so the player and actions stay reachable; text is never ellipsis-truncated.
+- **Inline preview player** — an `EnjoyCard` with a lit-fill play/pause circle and a single-row progress control (mono time · slider · mono duration). Both Express and Advanced mount the same `CraftPreviewPlayer`, which owns the single `CraftPreviewController` (`audioplayers` `AudioPlayer`) and feeds it `state.previewAudioBytes` from memory via `BytesSource`; a guard test keeps Craft's `AudioPlayer` construction confined to that controller.
+- **Voice** control (an `EnjoyCard` with an `EnjoyPressable` disclosure row showing the current voice label; expandable to full `VoicePicker` — changing voice re-synthesizes)
+- **Unsaved hint** — when `hasUnsavedPreview` is true, an inline callout (`craftAudioUnsavedHint`) reminds the learner that TTS bytes are in memory only until a save CTA runs
+- Two save CTAs (labels make persistence explicit):
+  - **Save & practice** (`saveAndPractice`) — full-width `EnjoyButton.primary`; saves and navigates to the player route with the new media ID
+  - **Save & say another** (`saveAndCaptureNext`) — full-width `EnjoyButton.secondary`; saves to library, shows a snackbar confirmation ("Saved to library"), then resets to the capture stage while preserving the language pair, style, and voice (remembered across sessions — see [Remembered preferences](#remembered-preferences)). This is the **rapid-capture loop** for building a personal library in quick succession.
+- **Leave / mode-switch guard** — `CraftScreen` blocks system back and the mode segmented control while `hasUnsavedPreview` (or while capturing). Confirming discard (`confirmDiscardUnsavedCraftPreview`) drops the in-memory preview; cancel keeps the learner on the audio stage. Preview is never written to SQLite until `saveToLibrary` succeeds.
+
+### Failure handling in Express stages
+
+Every Express stage watches `state.failure` and renders a calm error card using the failure's localized `message(l10n)` with a concrete action button mapped from `failure.action`. New failure types for the voice flow:
+
+| Failure | Trigger | Action |
+|---------|---------|--------|
+| `CraftAsrFailure` | ASR service error (offline, vendor down) | Retry |
+| `CraftEmptyTranscriptFailure` | ASR returned a transcript shorter than `craftMinTextLength` | Retry |
+
+Existing failures (`CraftTranslateFailure`, `CraftTtsFailure`, `CraftSaveFailure`, etc.) surface in the same way.
+
+**Failure surface treatment**: `CraftFailureCard` is a *persistent, blocking* stage state — it owns the whole stage body and carries the action the learner must take — so it stays an in-flow card rather than becoming an `AppNotice` toast (toasts auto-dismiss in ~5s and would strand the learner with no retry affordance). It is reskinned as an Aurora error surface: a `ShapeDecoration` + `RoundedSuperellipseBorder` panel tinted with the `scoreBadContainer` / `scoreBad` role tokens, an `EnjoyIcons.errorFill` orb in a hairline circle, a destructive `EnjoyButton.destructive` for the primary action, and a ghost credits CTA for `CraftCreditsFailure`. It borrows the toast's semantic-glyph-plus-error-token grammar (ADR-0089 §9) without adopting its transient lifetime. Inline, non-blocking failures in the two Advanced tool panels (translate / synthesize) use the compact `CraftInlineFailure` from the same file: a `scoreBad` caption plus the action the failure names — a ghost credits CTA (`/subscription`), sign-in (`/sign-in`), or open-AI-settings (`/settings/ai-providers`) button. Retry and switch-to-speak failures stay caption-only because the panel's own submit button is the retry affordance.
+
+## Advanced mode
+
+Retained for users who already have prepared text. Uses `EnjoyPageKind.hub` (same width family as AI settings) with **stacked** `EnjoyCard` panels — Translate above Synthesize — instead of a cramped dual column. Each panel is internally grouped: an `EnjoySectionHeader` for the tool name, a hairline-bordered `CraftLangTile` / `StylePicker` / `VoicePicker` control block, then an `EnjoyButton.primary` submit.
+
+### Translate tool (`TranslateTool`)
+
+- **Source language** picker (from the lookup language catalog)
+- **Target language** pre-filled from the learner's focus language; a ghost `EnjoyIconButton` swaps the pair
+- **Style preset** selector (formal, casual, etc.) with an optional custom prompt
+- **Edit / copy / re-translate** actions on the translated output
+- **Same-language guard**: selecting the same source and target language surfaces a localized hint to switch to Speak directly
+- Inline non-blocking failures render through the shared `CraftInlineFailure` — a `scoreBad` caption plus the action the failure names (see [Failure handling in Express stages](#failure-handling-in-express-stages))
+
+### Synthesize tool (`SynthesizeTool`)
+
+- **Text** input (either the translated result or pasted learning-language text), with a ghost `EnjoyIconButton` paste affordance
+- **Target language** (pre-filled) shown as a mono code in a `CraftLangTile` with a chevron affordance
+- **Voice picker** (Azure Neural voices per language)
+- **Preview** to hear a sample before saving — the shared `CraftPreviewPlayer` (play/pause + seek bar), identical to the Express audio stage
+- **Save** generates the audio file and inserts the media row
+
+### Voice picker (v1)
+
+Azure Neural voices grouped by language. Supported languages map to the subset of the lookup catalog that Enjoy TTS supports:
+
+| Code | Language | Voices |
+|------|----------|--------|
+| en-US | English (US) | 15+ neural voices |
+| zh-CN | Chinese (Mandarin) | 8+ neural voices |
+| ja-JP | Japanese | 5+ neural voices |
+| ko-KR | Korean | 3+ neural voices |
+| es-ES / es-MX | Spanish | 6+ neural voices |
+| fr-FR / fr-CA | French | 6+ neural voices |
+| de-DE | German | 5+ neural voices |
+| pt-BR / pt-PT | Portuguese | 3+ neural voices |
+| it-IT | Italian | 3+ neural voices |
+| ru-RU | Russian | 2+ neural voices |
+
+Per-call voice selection is v1 scope; the provider-default voice is used for initial creation. Voice names and gender labels come from `AzureVoice` (`lib/features/craft/domain/azure_voice.dart`).
+
+## Provider / capability routing
+
+| Action | Enjoy (default) | BYOK |
+|--------|----------------|------|
+| Translate | `chatServiceProvider` → Enjoy worker `POST /translations` | `chatServiceProvider` → BYOK LLM (OpenAI / Anthropic / Google-compatible) |
+| Synthesize | `ttsServiceProvider` → `EnjoyTtsCapability` → Azure Speech SDK (worker token) | `ttsServiceProvider` → BYOK TTS (OpenAI `/audio/speech` or Azure Speech subscription key) |
+
+**Azure Speech SDK wiring** (`lib/features/craft/data/craft_tts_service_synthesizer.dart`):
+1. Fetch a short-lived Azure token via `AzureTokenCache.getToken(purpose: 'tts', textLength: text.length)` (worker endpoint `POST /azure/tokens`, 9-min TTL). The TTS body sends `usage.tts.textLength` (character count) — not a duration estimate — to match the worker `azureTokenBodySchema` Zod validator and the web `@enjoy/ai` contract.
+2. Call `AzureSpeech.instance.synthesize(text, voice, locale)` through the native plugin ([`packages/azure_speech`](../../packages/azure_speech/)).
+3. The native SDK returns a WAV byte buffer; saved to the app's audio directory. Linux runs the same native SDK through the plugin's Linux implementation, word boundaries included ([ADR-0096](../decisions/0096-native-azure-speech-sdk-on-linux.md)).
+
+BYOK TTS follows the same `AzureSpeech.instance.synthesize` path when BYOK is configured with an Azure subscription key, or calls `TtsService` via the OpenAI-compatible HTTP path.
+
+## Word-segmented transcript
+
+After synthesis, `wordBoundary` events from the Azure Speech SDK produce time-aligned `startMs` / `durationMs` segments. The word segmenter (`lib/features/craft/domain/word_boundary_segmenter.dart`) groups words into **shadow-friendly lines** sized for shadow-reading practice (target 1.5–6 s spoken duration, hard cap 7 s). Break points follow a priority order: sentence-ending punctuation → clause punctuation (commas, semicolons, colons, em-dashes, CJK `、，；：`) → largest inter-word silence gap → duration cap. CJK text (zh/ja/ko, detected via the synth language) breaks by punctuation + duration only, never by word count, and joins segment text spacelessly.
+
+**All platforms with word boundaries**: Android, Windows, iOS, and macOS all capture Azure `WordBoundary` events and feed them through the same shadow-friendly segmenter. The iOS/macOS native plugin (`packages/azure_speech/`) registers `addSynthesisWordBoundaryEventHandler` before synthesis; note that the Azure Speech ObjC binding reports `duration` in seconds (converted to ticks at the native layer) and the `boundaryType` enum has a `Word`/`Punctuation` collision, so punctuation tokens are classified by text on the Dart side.
+
+**Solid timings only (ADR-0063)**: Craft writes a primary AI transcript (`source: 'ai'`) only when word boundaries are non-empty **and** the segmenter produces ≥1 non-empty line after punctuation merge. When word boundaries are missing (OpenAI BYOK TTS, or Linux which has no native TTS plugin), no transcript is saved — `primaryTimelineJson: null` is passed on import/update, which omits or deletes transcript rows. The audio file still saves successfully.
+
+**Always-on nested word/phone spans (ADR-0073 / ADR-0076)**: every real (non-dedupe) Craft save attempts on-device `alignSegments` and may attach nested `timeline` / `phones` onto those same spec 030 lines. Blank 030 JSON, a dedupe hit, PCM extract failure, or alignment failure persist today’s line-only (or blank) transcript — never a blocking save error, never an invented cue list. Learners still hear the Azure/Craft WAV; the spoken alignment reference is not played. Karaoke / IPA display are opt-in player transcript controls (ADR-0076).
+
+The save hook runs the shared alignment pipeline ([`align_lines_to_pcm.dart`](../../lib/data/subtitle/align_lines_to_pcm.dart)) that the on-demand transcript enrich also runs: decode 16 kHz mono PCM → align one segment per line → attach the word/phone spans back onto the lines → validate the line count. Craft **fails closed** on that pipeline's outcome (today's line-only transcript survives); the CC-sheet enrich reports a typed reason instead. The pipeline is shared so the alignment contract cannot drift between the two callers.
+
+- Items with a blank transcript open in the player with an empty transcript panel and a clear **Generate** affordance, allowing the learner to create cues via the existing player ASR flow (`launchAsrGeneration`) at any time.
+- No auto-STT runs on Craft save — the learner initiates ASR explicitly.
+- The `TranscriptTimestampEstimator` (duration-based proportional estimate) is no longer used on Craft save; the segmenter exclusively consumes live Azure word boundaries.
+
+## Output schema
+
+| Field | Value |
+|-------|-------|
+| `Audios.provider` | `'craft'` |
+| `Audios.source` | `'craft-express'` (Express mode), `'craft-translate'` (Advanced translate mode), or `'craft-direct'` (Advanced speak directly) |
+| `Audios.sourceText` | Original text (retained for re-generation). In Express mode this is the raw ASR transcript; in Advanced translate mode it is the source text; in speak directly it is empty. |
+| Audio file | WAV in app audio directory |
+| Transcript | One track (`source = 'ai'`) with word-boundary-segmented lines when solid timings are available; omitted (`null`) otherwise (see ADR-0063). When alignment succeeds on save, those lines may also store nested word/phone spans (ADR-0073 / ADR-0076). Secondary source-text track in translate mode. Blank-transcript items show an ASR Generate affordance in the player. |
+
+### Deduplication
+
+`SHA-256(sourceFlag | learningLanguage | normalizedText)`. Re-pasting identical text returns the existing media id without making any AI calls. `normalizedText` strips whitespace differences and normalizes Unicode so copy-paste variation does not defeat dedup. Express items use `sourceFlag = 'craft-express'`, so they dedupe independently from Advanced-mode items with the same text.
+
+## Library surface
+
+- **Craft badge**: Library tiles show a Craft indicator for items where `Audios.provider == 'craft'`.
+- **Sync routing**: `provider = 'craft'` participates in the existing sync queue (metadata + recording uploads).
+- **`deleteMedia` cleanup**: Deleting a Craft media item removes the audio file, transcript rows, and sync queue entry.
+- **Blank transcript**: Items where TTS synthesis did not produce reliable word boundaries open with an empty transcript panel and an ASR **Generate** affordance (ADR-0063). Learners can generate cues later via the player ASR flow.
+
+## Cross-platform sync (Crafted Audio Cloud Sync, ADR-0081)
+
+Crafted audios are uploaded to cloud storage so the same audio is playable from any device the user signs in on. Imported user files (`provider = 'user'`) and YouTube downloads (`provider = 'youtube'`) are explicitly out of scope — only the small crafted audios are uploaded automatically.
+
+- **Trigger**: `CraftAudioCloudUploader.uploadIfNeeded()` runs as a pre-step inside `SyncUploadService.uploadAudio()`, gated on `row.provider == 'craft'`. The binary is uploaded via the existing `DirectUploadsApi.uploadBlob` (Rails Active Storage direct upload), and the returned `signedId` is included in the JSON payload of `POST /api/v1/mine/audios`. The server attaches the blob and returns a populated `mediaUrl`.
+- **Offline tolerance**: the binary upload is part of the existing sync queue. Crafting while offline saves locally and queues the upload for the next sync drain. The library badge shows **Pending sync** until it succeeds.
+- **Idempotency**: the uploader skips a row when `mediaUrl` is already populated. `CraftLibraryRepository.updateCraftedFromText` resets `mediaUrl` to `null` on every edit so re-crafting always re-uploads the new bytes.
+- **UI badge**: `MediaCardSyncBadgePill` renders on the thumbnail top-right of `MediaCardRow` / `MediaCardTile` for crafted audios. Three states:
+  - **Synced to cloud** (green cloud-check) — `mediaUrl != null`.
+  - **Pending sync** (muted cloud-upload) — `mediaUrl == null && syncStatus == 'pending'`.
+  - **Local only** (muted cloud-off) — everything else.
+- **Delete**: `DELETE /api/v1/mine/audios/:id` is the single delete call. The server cascades to the underlying blob via `dependent: :destroy` (verified against the web app, which uses the same pattern).
+- **Scope guard**: `provider = 'user'` and `provider = 'youtube'` rows DO NOT trigger the uploader — verified by `test/features/sync/sync_upload_service_crafted_branch_test.dart`. Imported 50 MB+ files are not silently uploaded.
+
+See `specs/043-craft-cloud-sync/` for the full spec, plan, contracts, and quickstart validation scenarios.
+
+## Failure handling
+
+All failures go through the `CraftFailure` sealed hierarchy (`lib/features/craft/domain/craft_failure.dart`):
+
+| Failure | Trigger | Action |
+|---------|---------|--------|
+| `CraftTranslateFailure` | Translation API error | Retry |
+| `CraftTtsFailure` | TTS synthesis error | Retry or open AI settings |
+| `CraftSaveFailure` | File write or DB insert error | Retry |
+| `CraftSignInRequiredFailure` | Auth session missing | Sign in |
+| `CraftOfflineFailure` | No network | Retry when online |
+| `CraftSameLanguageFailure` | Source and target language match | Switch to Speak directly |
+| `CraftVendorUnsupportedLanguageFailure` | Vendor doesn't support the language | Retry (change language) |
+| `CraftAsrFailure` | ASR service error (Express mode only) | Retry |
+| `CraftEmptyTranscriptFailure` | ASR transcript shorter than `craftMinTextLength` (Express mode only) | Retry |
+| `CraftCreditsFailure` | Enjoy credits exhausted (worker 402) on any stage — carries the envelope so the message shows required vs. remaining credits | Retry + **View plans & packages** → `/subscription` (spec 045) |
+
+**All-or-nothing write**: Translation, synthesis, and save run in a single try block. If any stage fails, no repository write happens — no orphan transcript rows or audio files.
+
+## v1 limits and out-of-scope
+
+| Constraint | Detail |
+|------------|--------|
+| Text length | 5 000 characters (truncated with ellipsis) |
+| Voice picker | Azure Neural only; no local/offline TTS |
+| Output format | Audio-only (no video generation) |
+| Per-call voice | Provider-default voice used; picker is v1 |
+| Offline | Requires network (Enjoy worker or BYOK endpoint) |
+| Transcript (Linux / BYOK OpenAI) | Linux has no Azure Speech native plugin and OpenAI BYOK TTS does not produce Azure word boundaries — Craft items from those paths open without a timed transcript. Use the player ASR flow to generate cues. |
+
+## Responsive layout
+
+The Craft screen adapts to phone, tablet, and desktop widths (see [ADR-0055](../decisions/0055-adaptive-page-layout-system.md)):
+
+- **Express mode** uses `EnjoyPageKind.form` — a centered single column with adaptive gutters (no per-screen max widths)
+- **Advanced mode** uses `pageGutterOf` for full-bleed gutters
+- **AdvancedTools** uses a `LayoutBuilder` with a 600px breakpoint: side-by-side `Row` (TranslateTool left, SynthesizeTool right) on wide screens, stacked `Column` on narrow screens
+
+No `isWide` width calculations or ad-hoc max widths live in Craft widgets — all spacing flows from the layout-token system.
+
+## Architecture map
+
+| Layer | Key files |
+|-------|----------|
+| **Domain** | `craft_mode.dart`, `craft_screen_mode.dart`, `craft_stage.dart`, `craft_transcriber.dart`, `craft_failure.dart`, `craft_request.dart`, `craft_job_state.dart`, `craft_job_status.dart`, `craft_preferences.dart`, `craft_translator.dart`, `craft_synthesizer.dart`, `azure_voice.dart`, `translation_style.dart`, `word_boundary_segmenter.dart`, `transcript_timestamp_estimator.dart`, `wav_duration.dart` |
+| **Application** | `craft_controller.dart` (+ `craft_controller_core.dart`, `craft_translate_stage.dart`, `craft_synthesize_stage.dart`, `craft_capture_stage.dart`, `craft_library_stage.dart`, `craft_service_providers.dart`), `craft_preview_controller.dart`, `craft_preferences_provider.dart`, `craft_history_provider.dart` |
+| **Data** | `craft_translation_service_translator.dart`, `craft_tts_service_synthesizer.dart`, `craft_asr_service_transcriber.dart` |
+| **Presentation** | `craft_screen.dart`, `craft_history_screen.dart`, `express_flow.dart`, `capture_stage.dart` (+ `capture_stage_idle_view.dart`, `capture_stage_recording_view.dart`, `capture_stage_text_fallback.dart`), `rewrite_stage.dart`, `audio_stage.dart` (+ `audio_stage_script_block.dart`, `audio_stage_preview_player.dart`, `audio_stage_voice_chip.dart`, `audio_stage_actions.dart`), `widgets/craft_preview_player.dart`, `advanced_tools.dart`, `translate_tool.dart`, `synthesize_tool.dart`, `voice_picker.dart`, `style_picker.dart` |
+| **Integration** | `LibraryRepository.importCraftedFromText()`, `getCraftEditSource()`, `updateCraftedFromText()` (library data layer); `CraftEditSource` (library domain layer) |
+| **AI wiring** | `EnjoyTtsCapability` (`lib/features/ai/data/enjoy/`), `ChatService` / `TtsService` / `AsrService` providers |
+| **Native plugin** | [`packages/azure_speech`](../../packages/azure_speech/) (synthesize, word boundary events) |
+
+`CraftController` is assembled from one mixin per pipeline so no single file owns the whole Craft surface: `CraftControllerCore` (hydration latch, language/voice helpers), `CraftTranslateMixin` (text inputs + translation), `CraftSynthesizeMixin` (voice inputs + TTS + audio handoff), `CraftCaptureMixin` (capture, ASR, rewrite), and `CraftLibraryMixin` (save, dedup, edit restore). The three service providers live in `craft_service_providers.dart` and are re-exported by `craft_controller.dart`, so the public import surface (`CraftController`, `craftControllerProvider`, `craftSynthesizerProvider`, `craftTranslatorProvider`, `craftTranscriberProvider`) is unchanged.
+
+## Test pointers
+
+- Unit tests: `test/features/craft/` — covers `CraftFailure` messages, `WordBoundarySegmenter` grouping, dedup hashing, `TranscriptTimestampEstimator` (retained for legacy non-Craft uses), Auto-style prompt, Express capture/rewrite/save/reset flow, ASR + empty-transcript failure mapping, `loadForEdit` mode inference + editing save path (`craft_controller_test.dart`), `craftHistoryProvider` filter/sort (`craft_history_provider_test.dart`).
+- Widget tests: `test/features/craft/` — covers CraftScreen mode toggle, CaptureStage idle state, RewriteStage editable target + actions, AudioStage preview + actions, AdvancedTools responsive layout, TranslateTool / SynthesizeTool.
+- Repository tests: `test/features/craft/data/craft_library_repository_test.dart` — `getCraftEditSource` timeline reconstruction, `updateCraftedFromText` same-id update + stale-file cleanup.
+- Home / hotkey tests: `test/features/library/home_screen_test.dart` (Craft header action navigation), `test/features/hotkeys/global_craft_hotkey_test.dart` (hotkey registration).
+- Integration test surface: Craft import flow is exercised in the import-chooser integration test suite.
+
+## Related
+
+- [ADR-0081: Crafted Audio Cloud Sync](../decisions/0081-crafted-audio-cloud-sync.md)
+- [ADR-0061: Craft first-class Home entry, history, edit](../decisions/0061-craft-first-class-history.md)
+- [ADR-0062: Remove Craft history record keeps practice audio](../decisions/0062-craft-history-remove-keeps-audio.md)
+- [ADR-0060: Craft Voice-Express dual-mode redesign](../decisions/0060-craft-voice-express-dual-mode.md)
+- [ADR-0043: Craft from Text Import](../decisions/0043-craft-from-text-import.md)
+- [ADR-0063: Craft blank transcript without solid timings](../decisions/0063-craft-blank-transcript-without-solid-timings.md)
+- [ADR-0055: Adaptive page layout system](../decisions/0055-adaptive-page-layout-system.md)
+- [ADR-0014: AI Capabilities Layer](../decisions/0014-ai-capabilities-layer.md)
+- [ADR-0033: BYOK AI Provider Settings](../decisions/0033-byok-ai-provider-settings.md)
+- [AI capabilities](ai.md)
+- [Library](library.md)
+- [Transcript](transcript.md)
+- [Settings](settings.md)
+- [Spec 010: Craft from Text](../../specs/010-craft-from-text/)
+- [Spec 011: Craft Studio Redesign](../../specs/011-craft-studio-redesign/)
+- [Spec 028: Craft Voice-Express](../../specs/028-craft-voice-express/)

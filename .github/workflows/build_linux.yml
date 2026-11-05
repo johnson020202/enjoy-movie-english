@@ -1,0 +1,139 @@
+name: Build Linux
+
+on:
+  # PRs build only when native, dependency or build-tooling inputs change;
+  # Dart-only changes are covered by CI (analyze + tests) on the PR and by
+  # this build on the push to main. Run it on a PR branch on demand with:
+  #   gh workflow run build_linux.yml --ref <branch>
+  pull_request:
+    paths:
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "linux/**"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/scripts/ensure_linux_tooling.sh"
+      - "tool/prefetch_sqlite3_libs.sh"
+      - ".github/workflows/build_linux.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "lib/**"
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "analysis_options.yaml"
+      - "linux/**"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/scripts/ensure_linux_tooling.sh"
+      - "tool/prefetch_sqlite3_libs.sh"
+      - ".github/workflows/build_linux.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Cache misses must not reach pub.dev / storage.googleapis.com through the
+# per-GB proxy; these mirrors are routed DIRECT. pubspec.lock pins every
+# package by sha256, so a mirror serving different bytes fails the hash check.
+env:
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, Linux, ci]
+    steps:
+      - uses: actions/checkout@v6
+
+      # The job's inner environment is reset to a pristine state before each
+      # run, so ~/.pub-cache cannot persist on the runner between jobs. The
+      # cache backend is the LAN gh-sr-cache server: a hit costs zero proxy
+      # bytes, and only a miss re-uploads. The Flutter engine artifacts this
+      # build also needs live inside the SDK install, which does persist.
+      - name: Restore pub cache
+        id: pub-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Save pub cache
+        if: steps.pub-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: ${{ steps.pub-cache.outputs.cache-primary-key }}
+
+      - name: Ensure Linux tooling
+        run: bash .github/scripts/ensure_linux_tooling.sh
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # package:sqlite3 3.x downloads its prebuilt library from
+      # github.com/simolus3/sqlite3.dart/releases with Dart HttpClient (no
+      # retries), so a dropped TLS handshake fails the whole build with
+      # "Building native assets failed". Prefetch into the dart_build shared
+      # cache with curl (which retries) so the hook reuses it. The Apple and
+      # Android paths prefetch the same way.
+      - name: Prefetch sqlite3 Linux native libs
+        run: |
+          bash tool/prefetch_sqlite3_libs.sh linux \
+            || echo "::warning::prefetch_sqlite3_libs skipped; the dart_build hook will fetch on its own"
+
+      # flutter_inappwebview_linux FetchContent-downloads nlohmann/json from
+      # github.com on every configure (debug and release each), and that host
+      # drops TLS connections here. Fetch it once per version, with retries,
+      # into the tool cache (persists across jobs); linux/CMakeLists.txt
+      # points FetchContent at it via NLOHMANN_JSON_SOURCE_DIR.
+      - name: Prefetch nlohmann/json
+        run: |
+          set -euo pipefail
+          plugin_cmake=linux/flutter/ephemeral/.plugin_symlinks/flutter_inappwebview_linux/linux/CMakeLists.txt
+          version="$(sed -nE 's/^set\(NLOHMANN_JSON_VERSION "([0-9.]+)"\)/\1/p' "$plugin_cmake" | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::warning::Could not read NLOHMANN_JSON_VERSION; the build will fetch it itself."
+            exit 0
+          fi
+          dest="${RUNNER_TOOL_CACHE}/nlohmann-json-${version}"
+          if [ ! -f "$dest/CMakeLists.txt" ]; then
+            staging="$dest.partial"
+            rm -rf "$staging" && mkdir -p "$staging"
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+              -o "$staging/json.tar.xz" \
+              "https://github.com/nlohmann/json/releases/download/v${version}/json.tar.xz"
+            tar -xJf "$staging/json.tar.xz" -C "$staging" --strip-components=1
+            rm -f "$staging/json.tar.xz"
+            rm -rf "$dest" && mv "$staging" "$dest"
+          fi
+          echo "NLOHMANN_JSON_SOURCE_DIR=$dest" >> "$GITHUB_ENV"
+
+      - name: Flutter build linux (debug)
+        run: flutter build linux --debug
+
+      - name: Flutter build linux (release)
+        run: flutter build linux --release
+
+      - name: Upload debug bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoy-player-linux-debug-${{ github.sha }}
+          path: build/linux/x64/debug/bundle
+          retention-days: 1

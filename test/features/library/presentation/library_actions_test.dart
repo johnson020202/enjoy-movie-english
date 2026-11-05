@@ -1,0 +1,485 @@
+// ignore_for_file: scoped_providers_should_specify_dependencies
+// coverage.
+import 'dart:async';
+
+import 'package:enjoy_player/core/application/app_preferences_provider.dart';
+import 'package:enjoy_player/core/errors/app_failure.dart';
+import 'package:enjoy_player/core/notices/app_notice.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/domain/auth_state.dart';
+import 'package:enjoy_player/features/auth/domain/user_profile.dart';
+import 'package:enjoy_player/features/library/application/library_repository_provider.dart';
+import 'package:enjoy_player/features/library/data/library_repository.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+import 'package:enjoy_player/features/library/presentation/library_actions.dart';
+import 'package:enjoy_player/features/player/application/player_controller.dart';
+import 'package:enjoy_player/features/player/domain/playback_session.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:go_router/go_router.dart';
+
+const _profile = UserProfile(
+  id: 'user-1',
+  email: 'reader@example.com',
+  name: 'Reader',
+  avatarUrl: null,
+  balance: 0,
+  subscriptionTier: SubscriptionTier.free,
+  learningLanguage: 'en',
+);
+
+final _media = Media(
+  id: 'media-1',
+  kind: MediaKind.video,
+  title: 'Sample',
+  sourceUri: 'file:///sample.mp4',
+  durationMs: 1000,
+  language: 'en',
+  contentHash: 'hash-1',
+  fileSize: 1024,
+  createdAt: DateTime.utc(2024, 1, 1),
+  updatedAt: DateTime.utc(2024, 1, 1),
+);
+
+final _otherMedia = Media(
+  id: 'media-2',
+  kind: MediaKind.audio,
+  title: 'Other',
+  sourceUri: 'file:///other.mp3',
+  durationMs: 1000,
+  language: 'es',
+  contentHash: 'hash-2',
+  fileSize: 1024,
+  createdAt: DateTime.utc(2024, 1, 2),
+  updatedAt: DateTime.utc(2024, 1, 2),
+);
+
+class _FakeAuthCtrl extends AuthCtrl {
+  _FakeAuthCtrl(this._state);
+  final AuthState _state;
+
+  @override
+  Future<AuthState> build() async => _state;
+}
+
+class _NoSessionPlayerController extends PlayerController {
+  @override
+  PlaybackSession? build() => null;
+}
+
+class _SessionPlayerController extends PlayerController {
+  _SessionPlayerController(this._session);
+  final PlaybackSession _session;
+
+  @override
+  PlaybackSession? build() => _session;
+}
+
+class _PatchingPlayerController extends PlayerController {
+  _PatchingPlayerController(this._session);
+  final PlaybackSession _session;
+
+  int patchCalls = 0;
+
+  @override
+  PlaybackSession? build() => _session;
+
+  @override
+  void applySessionPatch(PlaybackSession patched) {
+    patchCalls++;
+  }
+}
+
+class _FakePrefsCtrl extends AppPreferencesCtrl {
+  _FakePrefsCtrl(this._value);
+  final AppPreferencesState _value;
+
+  @override
+  Future<AppPreferencesState> build() async => _value;
+}
+
+class _CountingLibraryRepository implements MediaLibraryRepository {
+  _CountingLibraryRepository({this.deleteThrows});
+
+  final Object? deleteThrows;
+
+  Completer<void>? updateGate;
+  int deleteCalls = 0;
+  int updateCalls = 0;
+  String? lastDeletedId;
+  String? lastUpdatedLanguage;
+  String? lastUpdatedId;
+
+  @override
+  Future<void> deleteMedia(String id) async {
+    deleteCalls++;
+    lastDeletedId = id;
+    if (deleteThrows != null) throw deleteThrows!;
+  }
+
+  @override
+  Future<void> updateMediaLanguage(String id, String language) async {
+    updateCalls++;
+    lastUpdatedId = id;
+    lastUpdatedLanguage = language;
+    final gate = updateGate;
+    if (gate != null) await gate.future;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) {
+    return null;
+  }
+}
+
+/// Harness widget that invokes a library action with the test context + ref.
+class _ActionHarness extends ConsumerWidget {
+  const _ActionHarness({required this.media, required this.action});
+
+  final Media media;
+  final _ActionKind action;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Scaffold(
+      body: Center(
+        child: FilledButton(
+          onPressed: () {
+            switch (action) {
+              case _ActionKind.confirmAndDelete:
+                unawaited(confirmAndDeleteMedia(context, ref, media));
+              case _ActionKind.showChooser:
+                unawaited(showImportChooser(context, ref));
+              case _ActionKind.editLanguage:
+                unawaited(editMediaLanguage(context, ref, media));
+            }
+          },
+          child: Text(action.label),
+        ),
+      ),
+    );
+  }
+}
+
+enum _ActionKind {
+  confirmAndDelete('Delete media'),
+  showChooser('Open chooser'),
+  editLanguage('Edit language');
+
+  const _ActionKind(this.label);
+  final String label;
+}
+
+List<Override> _overrides({
+  required _CountingLibraryRepository repo,
+  AuthState authState = const AuthSignedIn(profile: _profile),
+  PlaybackSession? session,
+  PlayerController? controller,
+}) => [
+  authCtrlProvider.overrideWith(() => _FakeAuthCtrl(authState)),
+  mediaLibraryRepositoryProvider.overrideWithValue(repo),
+  playerControllerProvider.overrideWith(() {
+    if (controller != null) return controller;
+    if (session != null) {
+      return _SessionPlayerController(session);
+    }
+    return _NoSessionPlayerController();
+  }),
+  appPreferencesCtrlProvider.overrideWith(
+    () => _FakePrefsCtrl(AppPreferencesState.initial),
+  ),
+];
+
+Widget _wrap({
+  required _CountingLibraryRepository repo,
+  required _ActionKind action,
+  required Media media,
+  AuthState authState = const AuthSignedIn(profile: _profile),
+  PlaybackSession? session,
+  PlayerController? controller,
+  ProviderContainer? container,
+}) {
+  final router = GoRouter(
+    initialLocation: '/',
+    routes: [
+      GoRoute(
+        path: '/',
+        builder: (_, _) => _ActionHarness(media: media, action: action),
+      ),
+      GoRoute(
+        path: '/craft',
+        builder: (_, _) => const Scaffold(body: Text('CraftRoute')),
+      ),
+    ],
+  );
+  addTearDown(router.dispose);
+
+  final overrides = _overrides(
+    repo: repo,
+    authState: authState,
+    session: session,
+    controller: controller,
+  );
+
+  final scheme = ColorScheme.fromSeed(
+    seedColor: const Color(0xFF7B61FF),
+    brightness: Brightness.dark,
+  );
+
+  final scope = container ?? ProviderContainer(overrides: overrides);
+  if (container == null) addTearDown(scope.dispose);
+
+  return UncontrolledProviderScope(
+    container: scope,
+    child: MaterialApp.router(
+      theme: ThemeData(
+        colorScheme: scheme,
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        extensions: [EnjoyThemeTokens.build(scheme)],
+      ),
+      locale: const Locale('en', 'US'),
+      localizationsDelegates: const [
+        AppLocalizations.delegate,
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: AppLocalizations.supportedLocales,
+      scaffoldMessengerKey: appScaffoldMessengerKey,
+      routerConfig: router,
+    ),
+  );
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('confirmAndDeleteMedia', () {
+    testWidgets('shows confirmation dialog with title + content', (
+      tester,
+    ) async {
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.confirmAndDelete, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete media'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Delete from library?'), findsOneWidget);
+      expect(find.textContaining('Sample'), findsWidgets);
+
+      await tester.tapAt(const Offset(10, 10));
+      await tester.pumpAndSettle();
+      expect(repo.deleteCalls, 0);
+    });
+
+    testWidgets('confirming delete calls deleteMedia', (tester) async {
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.confirmAndDelete, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete media'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+
+      expect(repo.deleteCalls, 1);
+      expect(repo.lastDeletedId, _media.id);
+    });
+
+    testWidgets('delete failure surfaces error notice', (tester) async {
+      final repo = _CountingLibraryRepository(
+        deleteThrows: const FileFailure('boom'),
+      );
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.confirmAndDelete, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete media'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 500));
+
+      expect(repo.deleteCalls, 1);
+      expect(find.byType(SnackBar), findsWidgets);
+    });
+
+    testWidgets('confirms a different media id without affecting session', (
+      tester,
+    ) async {
+      final session = PlaybackSession(
+        mediaId: 'media-other',
+        dexieTargetType: 'Video',
+        mediaType: 'video',
+        mediaTitle: 'Other',
+        durationSeconds: 10,
+        currentTimeSeconds: 0,
+        currentSegmentIndex: 0,
+        language: 'en',
+        startedAt: DateTime.utc(2024, 1, 1),
+        lastActiveAt: DateTime.utc(2024, 1, 1),
+      );
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(
+          repo: repo,
+          action: _ActionKind.confirmAndDelete,
+          media: _otherMedia,
+          session: session,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete media'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+
+      expect(repo.deleteCalls, 1);
+      expect(repo.lastDeletedId, _otherMedia.id);
+    });
+
+    testWidgets('cancelling the dialog skips deleteMedia', (tester) async {
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.confirmAndDelete, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Delete media'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+
+      expect(repo.deleteCalls, 0);
+    });
+  });
+
+  group('showImportChooser', () {
+    testWidgets('renders three list tiles', (tester) async {
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.showChooser, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Open chooser'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('From file…'), findsOneWidget);
+      expect(find.text('From YouTube URL…'), findsOneWidget);
+      expect(find.text('Craft…'), findsOneWidget);
+
+      await tester.tapAt(const Offset(20, 20));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('tapping Craft tile navigates to /craft', (tester) async {
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.showChooser, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Open chooser'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Craft…'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('CraftRoute'), findsOneWidget);
+    });
+  });
+
+  group('editMediaLanguage', () {
+    testWidgets('does not touch the repository without a picker selection', (
+      tester,
+    ) async {
+      final repo = _CountingLibraryRepository();
+      await tester.pumpWidget(
+        _wrap(repo: repo, action: _ActionKind.editLanguage, media: _media),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Edit language'));
+      await tester.pumpAndSettle();
+
+      expect(repo.updateCalls, 0);
+    });
+
+    testWidgets(
+      'applies the saved language to the open session when the screen closes mid-save',
+      (tester) async {
+        final gate = Completer<void>();
+        final repo = _CountingLibraryRepository()..updateGate = gate;
+        final controller = _PatchingPlayerController(
+          PlaybackSession(
+            mediaId: _otherMedia.id,
+            dexieTargetType: 'Video',
+            mediaType: 'video',
+            mediaTitle: 'Other',
+            durationSeconds: 10,
+            currentTimeSeconds: 0,
+            currentSegmentIndex: 0,
+            language: 'es',
+            startedAt: DateTime.utc(2024, 1, 1),
+            lastActiveAt: DateTime.utc(2024, 1, 1),
+          ),
+        );
+
+        final container = ProviderContainer(
+          overrides: _overrides(repo: repo, controller: controller),
+        );
+        addTearDown(container.dispose);
+
+        await tester.pumpWidget(
+          _wrap(
+            repo: repo,
+            action: _ActionKind.editLanguage,
+            media: _otherMedia,
+            controller: controller,
+            container: container,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('Edit language'));
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('English (US)'));
+        await tester.pumpAndSettle();
+
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: const SizedBox.shrink(),
+          ),
+        );
+        gate.complete();
+        await tester.pumpAndSettle();
+
+        expect(repo.updateCalls, 1);
+        expect(repo.lastUpdatedLanguage, 'en-US');
+        expect(controller.patchCalls, 1);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  });
+}

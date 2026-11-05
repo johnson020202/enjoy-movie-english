@@ -1,0 +1,817 @@
+// ignore_for_file: avoid_redundant_argument_values, cascade_invocations
+import 'dart:convert';
+
+import 'package:drift/native.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/data/subtitle/transcript_line.dart';
+import 'package:enjoy_player/features/player/application/echo_mode_provider.dart';
+import 'package:enjoy_player/features/player/application/player_controller.dart';
+import 'package:enjoy_player/features/player/application/player_engine_test_double_provider.dart';
+import 'package:enjoy_player/features/player/application/player_interactions.dart';
+import 'package:enjoy_player/features/player/application/player_lens_provider.dart';
+import 'package:enjoy_player/features/player/domain/player_lens.dart';
+import 'package:enjoy_player/features/player/domain/playback_session.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_blur_mode_provider.dart';
+import 'package:enjoy_player/features/transcript/application/transcript_repository_provider.dart';
+import 'package:enjoy_player/features/transcript/application/word_practice_session.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import '../../support/fake_player_engine.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  const mediaId = 'm1';
+  const transcriptId = 't1';
+  const altMediaId = 'm2';
+
+  final lines = <TranscriptLine>[
+    const TranscriptLine(text: 'line 1', startMs: 0, durationMs: 2000),
+    const TranscriptLine(text: 'line 2', startMs: 2000, durationMs: 2000),
+    const TranscriptLine(text: 'line 3', startMs: 4000, durationMs: 2000),
+    const TranscriptLine(text: 'line 4', startMs: 6000, durationMs: 2000),
+  ];
+
+  final timelineJson = jsonEncode(
+    lines
+        .map(
+          (l) => {'text': l.text, 'start': l.startMs, 'duration': l.durationMs},
+        )
+        .toList(),
+  );
+
+  late AppDatabase db;
+  late FakePlayerEngine fake;
+  late ProviderContainer container;
+
+  PlaybackSession sessionFor(String id, {double currentTime = 0.5}) {
+    final now = DateTime(2026, 7, 25);
+    return PlaybackSession(
+      mediaId: id,
+      dexieTargetType: 'Audio',
+      mediaType: 'audio',
+      mediaTitle: 't',
+      durationSeconds: 30,
+      currentTimeSeconds: currentTime,
+      currentSegmentIndex: 0,
+      language: 'en',
+      startedAt: now,
+      lastActiveAt: now,
+    );
+  }
+
+  Future<void> insertAudioRow(String id) async {
+    final now = DateTime.now();
+    await db.audioDao.insertRow(
+      AudioRow(
+        id: id,
+        aid: 'a-$id',
+        provider: 'user',
+        title: 't',
+        description: null,
+        thumbnailUrl: null,
+        durationSeconds: 30,
+        language: 'en',
+        translationKey: null,
+        sourceText: null,
+        voice: null,
+        source: null,
+        localUri: null,
+        md5: null,
+        size: 0,
+        mediaUrl: null,
+        syncStatus: null,
+        serverUpdatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      ),
+    );
+  }
+
+  Future<void> seedTranscript({String forMedia = mediaId}) async {
+    await db.transcriptDao.upsert(
+      TranscriptRow(
+        id: transcriptId,
+        targetType: 'Audio',
+        targetId: forMedia,
+        language: 'en',
+        source: 'official',
+        timelineJson: timelineJson,
+        referenceId: null,
+        label: '',
+        trackIndex: null,
+        syncStatus: null,
+        serverUpdatedAt: null,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+      ),
+    );
+    final now = DateTime.now();
+    await db.echoSessionDao.updatePrimaryTranscriptForTarget(
+      'Audio',
+      forMedia,
+      transcriptId,
+    );
+    final existing = await db.echoSessionDao.getLatestForTarget(
+      'Audio',
+      forMedia,
+    );
+    await db.echoSessionDao.upsert(
+      existing!.copyWith(lastActiveAt: now, updatedAt: now),
+    );
+  }
+
+  setUp(() {
+    db = AppDatabase(executor: NativeDatabase.memory());
+    fake = FakePlayerEngine();
+    container = ProviderContainer(
+      overrides: [
+        appDatabaseProvider.overrideWithValue(db),
+        deviceGlobalAppDatabaseProvider.overrideWithValue(db),
+        playerEngineTestDoubleProvider.overrideWithValue(fake),
+        transcriptRepositoryProvider.overrideWithValue(
+          TranscriptRepository(db),
+        ),
+      ],
+    );
+  });
+
+  tearDown(() async {
+    container.dispose();
+    await db.close();
+    await fake.dispose();
+  });
+
+  setUpSession({String forMedia = mediaId, double currentTime = 0.5}) {
+    container
+        .read(playerControllerProvider.notifier)
+        .publishSession(sessionFor(forMedia, currentTime: currentTime));
+  }
+
+  /// Simulates a re-import: replaces the primary transcript with [importLines].
+  Future<void> reimportTranscript(List<TranscriptLine> importLines) async {
+    await db.transcriptDao.upsert(
+      TranscriptRow(
+        id: '$transcriptId-reimport',
+        targetType: 'Audio',
+        targetId: mediaId,
+        language: 'en',
+        source: 'official',
+        timelineJson: jsonEncode(
+          importLines
+              .map(
+                (l) => {
+                  'text': l.text,
+                  'start': l.startMs,
+                  'duration': l.durationMs,
+                },
+              )
+              .toList(),
+        ),
+        referenceId: null,
+        label: '',
+        trackIndex: null,
+        syncStatus: null,
+        serverUpdatedAt: null,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+      ),
+    );
+    await db.echoSessionDao.updatePrimaryTranscriptForTarget(
+      'Audio',
+      mediaId,
+      '$transcriptId-reimport',
+    );
+  }
+
+  test('prevLine bails out when there is no session', () async {
+    final n = container.read(playerInteractionsProvider);
+    await n.prevLine();
+    expect(fake.seekCalls, isEmpty);
+    expect(fake.playCallCount, 0);
+  });
+
+  test('prevLine bails out when there is no transcript', () async {
+    setUpSession();
+    final n = container.read(playerInteractionsProvider);
+    await n.prevLine();
+    expect(fake.seekCalls, isEmpty);
+    expect(fake.playCallCount, 0);
+  });
+
+  test('nextLine bails out when there are no transcript lines', () async {
+    setUpSession();
+    final n = container.read(playerInteractionsProvider);
+    await n.nextLine();
+    expect(fake.seekCalls, isEmpty);
+    expect(fake.playCallCount, 0);
+  });
+
+  test('nextLine seeks to next line start and plays (no echo)', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 2.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.nextLine();
+    expect(fake.seekCalls, [const Duration(seconds: 4)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test('nextLine clamps at last line', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 8.0);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.nextLine();
+    expect(fake.seekCalls, [const Duration(seconds: 6)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test('prevLine seeks to previous line start and plays (no echo)', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.prevLine();
+    expect(fake.seekCalls, [const Duration(seconds: 2)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test('prevLine clamps at first line', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 0.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.prevLine();
+    expect(fake.seekCalls, [const Duration(seconds: 0)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test('nextLine uses echo.endLineIndex when echo is active', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.0);
+    container
+        .read(echoModeProvider.notifier)
+        .activate(
+          startLineIndex: 1,
+          endLineIndex: 1,
+          startTimeSeconds: 2,
+          endTimeSeconds: 4,
+        );
+
+    final n = container.read(playerInteractionsProvider);
+    await n.nextLine();
+    expect(fake.seekCalls, [const Duration(seconds: 4)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test('prevLine uses echo.startLineIndex when echo is active', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 5.0);
+    container
+        .read(echoModeProvider.notifier)
+        .activate(
+          startLineIndex: 1,
+          endLineIndex: 2,
+          startTimeSeconds: 2,
+          endTimeSeconds: 6,
+        );
+
+    final n = container.read(playerInteractionsProvider);
+    await n.prevLine();
+    expect(fake.seekCalls, [const Duration(seconds: 0)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test('replayLine seeks to active line start and plays (no echo)', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.replayLine();
+    expect(fake.seekCalls, [const Duration(seconds: 4)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test(
+    'replayLine seeks to echo.startTimeSeconds when echo is active',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      setUpSession(currentTime: 4.5);
+      container
+          .read(echoModeProvider.notifier)
+          .activate(
+            startLineIndex: 1,
+            endLineIndex: 1,
+            startTimeSeconds: 2,
+            endTimeSeconds: 4,
+          );
+
+      final n = container.read(playerInteractionsProvider);
+      await n.replayLine();
+      expect(fake.seekCalls, [const Duration(seconds: 2)]);
+      expect(fake.playCallCount, 1);
+    },
+  );
+
+  test('toggleEcho activates echo when off', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleEcho();
+    final echo = container.read(echoModeProvider);
+    expect(echo.active, isTrue);
+    expect(echo.startLineIndex, 2);
+    expect(echo.endLineIndex, 2);
+  });
+
+  test('toggleEcho deactivates echo when on', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+    container
+        .read(echoModeProvider.notifier)
+        .activate(
+          startLineIndex: 1,
+          endLineIndex: 1,
+          startTimeSeconds: 2,
+          endTimeSeconds: 4,
+        );
+
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleEcho();
+    expect(container.read(echoModeProvider).active, isFalse);
+  });
+
+  test('toggleEcho bails out when currentTime is not in any line', () async {
+    await insertAudioRow(mediaId);
+    final futureLines = <TranscriptLine>[
+      const TranscriptLine(text: 'a', startMs: 20000, durationMs: 2000),
+      const TranscriptLine(text: 'b', startMs: 22000, durationMs: 2000),
+    ];
+    await db.transcriptDao.upsert(
+      TranscriptRow(
+        id: 't-future',
+        targetType: 'Audio',
+        targetId: mediaId,
+        language: 'en',
+        source: 'official',
+        timelineJson: jsonEncode(
+          futureLines
+              .map(
+                (l) => {
+                  'text': l.text,
+                  'start': l.startMs,
+                  'duration': l.durationMs,
+                },
+              )
+              .toList(),
+        ),
+        referenceId: null,
+        label: '',
+        trackIndex: null,
+        syncStatus: null,
+        serverUpdatedAt: null,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+      ),
+    );
+    await db.echoSessionDao.updatePrimaryTranscriptForTarget(
+      'Audio',
+      mediaId,
+      't-future',
+    );
+    setUpSession(currentTime: 1.0);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleEcho();
+    expect(container.read(echoModeProvider).active, isFalse);
+  });
+
+  test('toggleBlur activates when there are lines', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession();
+
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleBlur();
+    expect(container.read(transcriptBlurModeProvider), isTrue);
+
+    final row = await db.echoSessionDao.getLatestForTarget('Audio', mediaId);
+    expect(row, isNotNull);
+  });
+
+  test('toggleBlur deactivates even when there are no lines', () async {
+    await insertAudioRow(mediaId);
+    setUpSession();
+    container.read(transcriptBlurModeProvider.notifier).activate();
+
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleBlur();
+    expect(container.read(transcriptBlurModeProvider), isFalse);
+  });
+
+  test('toggleBlur does not activate when there are no lines', () async {
+    await insertAudioRow(mediaId);
+    setUpSession();
+
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleBlur();
+    expect(container.read(transcriptBlurModeProvider), isFalse);
+  });
+
+  test('toggleBlur leaves Echo: the lenses are exclusive (R4)', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleEcho();
+    expect(container.read(echoModeProvider).active, isTrue);
+
+    await n.toggleBlur();
+    expect(container.read(transcriptBlurModeProvider), isTrue);
+    expect(container.read(echoModeProvider).active, isFalse);
+    expect(container.read(playerLensProvider), PlayerLens.dictate);
+  });
+
+  test(
+    'leaving a restored both-on session collapses to Listen (review)',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      setUpSession(currentTime: 4.5);
+      container
+          .read(echoModeProvider.notifier)
+          .activate(
+            startLineIndex: 1,
+            endLineIndex: 1,
+            startTimeSeconds: 2,
+            endTimeSeconds: 4,
+          );
+      container.read(transcriptBlurModeProvider.notifier).activate();
+      final n = container.read(playerInteractionsProvider);
+
+      await n.toggleEcho();
+      expect(container.read(echoModeProvider).active, isFalse);
+      expect(container.read(transcriptBlurModeProvider), isFalse);
+      expect(container.read(playerLensProvider), PlayerLens.listen);
+
+      container
+          .read(echoModeProvider.notifier)
+          .activate(
+            startLineIndex: 1,
+            endLineIndex: 1,
+            startTimeSeconds: 2,
+            endTimeSeconds: 4,
+          );
+      container.read(transcriptBlurModeProvider.notifier).activate();
+      await n.toggleBlur();
+      expect(container.read(echoModeProvider).active, isFalse);
+      expect(container.read(transcriptBlurModeProvider), isFalse);
+      expect(container.read(playerLensProvider), PlayerLens.listen);
+    },
+  );
+
+  test('toggleEcho leaves Dictate: the lenses are exclusive (R4)', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleBlur();
+    expect(container.read(transcriptBlurModeProvider), isTrue);
+
+    await n.toggleEcho();
+    expect(container.read(echoModeProvider).active, isTrue);
+    expect(container.read(transcriptBlurModeProvider), isFalse);
+    expect(container.read(playerLensProvider), PlayerLens.echo);
+  });
+
+  test('selectLens moves between all three lenses', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 4.5);
+    final n = container.read(playerInteractionsProvider);
+    expect(container.read(playerLensProvider), PlayerLens.listen);
+
+    await n.selectLens(PlayerLens.dictate);
+    expect(container.read(playerLensProvider), PlayerLens.dictate);
+    await n.selectLens(PlayerLens.echo);
+    expect(container.read(playerLensProvider), PlayerLens.echo);
+    expect(container.read(transcriptBlurModeProvider), isFalse);
+    await n.selectLens(PlayerLens.listen);
+    expect(container.read(playerLensProvider), PlayerLens.listen);
+    await n.selectLens(PlayerLens.dictate);
+    await n.selectLens(PlayerLens.listen);
+    expect(container.read(playerLensProvider), PlayerLens.listen);
+    expect(container.read(echoModeProvider).active, isFalse);
+    expect(container.read(transcriptBlurModeProvider), isFalse);
+  });
+
+  test('toggleBlur bails out when there is no session', () async {
+    final n = container.read(playerInteractionsProvider);
+    await n.toggleBlur();
+    expect(container.read(transcriptBlurModeProvider), isFalse);
+  });
+
+  test(
+    'expandEchoBackward / expandEchoForward / shrink variants require echo on',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      setUpSession(currentTime: 4.5);
+
+      final n = container.read(playerInteractionsProvider);
+      await n.expandEchoBackward();
+      await n.expandEchoForward();
+      await n.shrinkEchoBackward();
+      await n.shrinkEchoForward();
+      expect(container.read(echoModeProvider).active, isFalse);
+
+      container
+          .read(echoModeProvider.notifier)
+          .activate(
+            startLineIndex: 1,
+            endLineIndex: 2,
+            startTimeSeconds: 2,
+            endTimeSeconds: 6,
+          );
+      await n.expandEchoBackward();
+      expect(container.read(echoModeProvider).startLineIndex, 0);
+      await n.expandEchoForward();
+      expect(container.read(echoModeProvider).endLineIndex, 3);
+      await n.shrinkEchoBackward();
+      expect(container.read(echoModeProvider).startLineIndex, 1);
+      await n.shrinkEchoForward();
+      expect(container.read(echoModeProvider).endLineIndex, 2);
+    },
+  );
+
+  test('expand/shrink bail out when there are no lines', () async {
+    await insertAudioRow(mediaId);
+    setUpSession(currentTime: 4.5);
+    container
+        .read(echoModeProvider.notifier)
+        .activate(
+          startLineIndex: 1,
+          endLineIndex: 2,
+          startTimeSeconds: 2,
+          endTimeSeconds: 6,
+        );
+
+    final n = container.read(playerInteractionsProvider);
+    await n.expandEchoBackward();
+    await n.expandEchoForward();
+    await n.shrinkEchoBackward();
+    await n.shrinkEchoForward();
+    final echo = container.read(echoModeProvider);
+    expect(echo.startLineIndex, 1);
+    expect(echo.endLineIndex, 2);
+  });
+
+  test('seekToProgressFraction clamps fraction and seeks', () async {
+    await insertAudioRow(mediaId);
+    setUpSession();
+
+    final n = container.read(playerInteractionsProvider);
+    await n.seekToProgressFraction(0.5);
+    expect(fake.seekCalls, [const Duration(seconds: 15)]);
+
+    await n.seekToProgressFraction(1.5);
+    expect(fake.seekCalls.last, const Duration(seconds: 30));
+
+    await n.seekToProgressFraction(-1.0);
+    expect(fake.seekCalls.last, Duration.zero);
+  });
+
+  test('seekToProgressFraction bails out when duration <= 0', () async {
+    await insertAudioRow(mediaId);
+    container
+        .read(playerControllerProvider.notifier)
+        .publishSession(sessionFor(mediaId).copyWith(durationSeconds: 0));
+
+    final n = container.read(playerInteractionsProvider);
+    await n.seekToProgressFraction(0.5);
+    expect(fake.seekCalls, isEmpty);
+  });
+
+  test('seekToProgressFraction bails out when no session', () async {
+    final n = container.read(playerInteractionsProvider);
+    await n.seekToProgressFraction(0.5);
+    expect(fake.seekCalls, isEmpty);
+  });
+
+  test('seekToLine delegates to _seekLine (no echo)', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 2.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.seekToLine(lines[2], 2);
+    expect(fake.seekCalls, [const Duration(seconds: 4)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test(
+    'seekToLine activates echo and seeks with window when echo is on',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      setUpSession(currentTime: 4.5);
+      container
+          .read(echoModeProvider.notifier)
+          .activate(
+            startLineIndex: 0,
+            endLineIndex: 0,
+            startTimeSeconds: 0,
+            endTimeSeconds: 2,
+          );
+
+      final n = container.read(playerInteractionsProvider);
+      await n.seekToLine(lines[2], 2);
+      final echo = container.read(echoModeProvider);
+      expect(echo.startLineIndex, 2);
+      expect(echo.endLineIndex, 2);
+      expect(fake.seekCalls, [const Duration(seconds: 4)]);
+      expect(fake.playCallCount, 1);
+    },
+  );
+
+  test('line cache reuses cached lines when media is unchanged', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 0.5);
+
+    final n = container.read(playerInteractionsProvider);
+    await n.nextLine();
+    expect(fake.seekCalls, hasLength(1));
+
+    await n.nextLine();
+    expect(fake.seekCalls, hasLength(2));
+  });
+
+  test(
+    'line cache resets when media changes (different transcript fetched)',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      await insertAudioRow(altMediaId);
+
+      setUpSession(forMedia: mediaId, currentTime: 0.5);
+      final n = container.read(playerInteractionsProvider);
+      await n.nextLine();
+      expect(fake.seekCalls, hasLength(1));
+
+      container
+          .read(playerControllerProvider.notifier)
+          .publishSession(sessionFor(altMediaId, currentTime: 0.5));
+      await n.nextLine();
+      expect(fake.seekCalls, hasLength(1));
+    },
+  );
+
+  test(
+    'previous-no-session path: replayLine bails out when session null',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      final n = container.read(playerInteractionsProvider);
+      await n.replayLine();
+      expect(fake.seekCalls, isEmpty);
+    },
+  );
+
+  test(
+    'line cache drops stale lines when the transcript is re-imported',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      setUpSession(currentTime: 0.5);
+
+      final n = container.read(playerInteractionsProvider);
+      await n.nextLine();
+      expect(fake.seekCalls, [const Duration(seconds: 2)]);
+
+      await reimportTranscript(const [
+        TranscriptLine(text: 'new 1', startMs: 0, durationMs: 2000),
+        TranscriptLine(text: 'new 2', startMs: 9000, durationMs: 2000),
+      ]);
+      await pumpEventQueue();
+
+      await n.nextLine();
+      expect(fake.seekCalls.last, const Duration(seconds: 9));
+    },
+  );
+
+  test('replayLine bails out when there are no lines', () async {
+    setUpSession();
+    final n = container.read(playerInteractionsProvider);
+    await n.replayLine();
+    expect(fake.seekCalls, isEmpty);
+  });
+
+  test('EchoState.inactive static is reused across operations', () {
+    const e = EchoState.inactive;
+    expect(e.active, isFalse);
+    expect(e.startLineIndex, -1);
+    expect(e.endLineIndex, -1);
+    expect(e.startTimeSeconds, -1);
+    expect(e.endTimeSeconds, -1);
+    expect(
+      e,
+      const EchoState(
+        active: false,
+        startLineIndex: -1,
+        endLineIndex: -1,
+        startTimeSeconds: -1,
+        endTimeSeconds: -1,
+      ),
+    );
+  });
+
+  test('seekToWord lands on the word start, not the line start', () async {
+    await insertAudioRow(mediaId);
+    await seedTranscript();
+    setUpSession(currentTime: 0.5);
+    const nested = TranscriptLine(
+      text: 'Hello world',
+      startMs: 1000,
+      durationMs: 2000,
+      timeline: [
+        TranscriptWord(text: 'Hello', startMs: 0, durationMs: 500),
+        TranscriptWord(text: 'world', startMs: 500, durationMs: 500),
+      ],
+    );
+
+    final n = container.read(playerInteractionsProvider);
+    await n.seekToWord(nested, 0, 1);
+    expect(fake.seekCalls, [const Duration(milliseconds: 1500)]);
+    expect(fake.playCallCount, 1);
+  });
+
+  test(
+    'seekToWord with echo on retargets echo to the line but lands on word',
+    () async {
+      await insertAudioRow(mediaId);
+      await seedTranscript();
+      setUpSession(currentTime: 0.5);
+      const nested = TranscriptLine(
+        text: 'Hello world',
+        startMs: 1000,
+        durationMs: 2000,
+        timeline: [
+          TranscriptWord(text: 'Hello', startMs: 0, durationMs: 500),
+          TranscriptWord(text: 'world', startMs: 500, durationMs: 500),
+        ],
+      );
+      container
+          .read(echoModeProvider.notifier)
+          .activate(
+            startLineIndex: 2,
+            endLineIndex: 2,
+            startTimeSeconds: 4,
+            endTimeSeconds: 6,
+          );
+
+      final n = container.read(playerInteractionsProvider);
+      await n.seekToWord(nested, 0, 1);
+      final echo = container.read(echoModeProvider);
+      expect(echo.startLineIndex, 0);
+      expect(echo.endLineIndex, 0);
+      expect(echo.startTimeSeconds, nested.startSeconds);
+      expect(echo.endTimeSeconds, nested.endSeconds);
+      expect(fake.seekCalls, [const Duration(milliseconds: 1500)]);
+    },
+  );
+
+  test('seekToProgressFraction clears the ephemeral word loop', () async {
+    await insertAudioRow(mediaId);
+    setUpSession(currentTime: 0.5);
+    container
+        .read(wordPracticeSessionProvider(mediaId).notifier)
+        .startLoop(lineIndex: 0, wordIndex: 0, startMs: 1000, endMs: 1500);
+    expect(
+      container.read(wordPracticeSessionProvider(mediaId)).isLooping,
+      isTrue,
+    );
+
+    await container
+        .read(playerInteractionsProvider)
+        .seekToProgressFraction(0.5);
+    expect(
+      container.read(wordPracticeSessionProvider(mediaId)).isLooping,
+      isFalse,
+    );
+  });
+}

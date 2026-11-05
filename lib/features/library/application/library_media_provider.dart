@@ -1,0 +1,82 @@
+/// Stream of all library media (manual provider — avoids riverpod_generator + Drift edge case).
+library;
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:flutter/foundation.dart';
+import 'package:enjoy_player/core/utils/stream_combine_latest.dart';
+import 'package:enjoy_player/core/utils/stream_distinct.dart';
+import 'package:enjoy_player/data/db/media_registry_provider.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+
+import 'library_search_provider.dart';
+
+final libraryMediaProvider = StreamProvider<List<Media>>((ref) {
+  return ref.watch(mediaRegistryProvider).watchAll();
+});
+
+/// Up to 12 most recently updated items for [HomeScreen] (pre-sorted).
+///
+/// Served from the registry's `LIMIT 12 ORDER BY updated_at DESC` merge
+/// (issue #810 D6) — the full library is no longer sorted in Dart on every
+/// table write. Applies the same library-wide dedupe as
+/// [libraryFilteredListsProvider]: a Drift tick that re-queries without
+/// changing the top-12 still produces a brand-new list, which would
+/// otherwise rebuild every `ConsumerWidget` watching this provider. Skip the
+/// emission when the new top-12 is element-wise equal to the previous one.
+final libraryHomeRecentsProvider = StreamProvider<List<Media>>((ref) {
+  const recentLimit = 12;
+  final registry = ref.watch(mediaRegistryProvider);
+  return registry.watchRecentByUpdatedAt(recentLimit);
+});
+
+/// Total library row count per kind, for the library tab headers.
+///
+/// Counted inside the `MediaRegistry` merge seam from the two DAO halves, so
+/// `LocalLibraryTabView` reads `List.length` rather than walking the whole
+/// merged `List<Media>` on every library table write (issue #818). This is the
+/// unfiltered total, so a search query still reports "N of M" against the full
+/// library rather than the narrowed list.
+///
+/// Dedupe repeats the registry's own gate so the provider's contract holds on
+/// its own: a Drift tick that re-queries without changing either count must not
+/// rebuild the tab bodies.
+final libraryKindCountsProvider = StreamProvider<({int audio, int video})>((
+  ref,
+) {
+  return ref
+      .watch(mediaRegistryProvider)
+      .watchKindCounts()
+      .distinctBy((previous, current) => previous == current);
+});
+
+/// Pre-filtered audio/video lists for [LibraryScreen], newest [Media.updatedAt]
+/// first (same ordering as Home recent media).
+///
+/// The registry's `watchAll()` re-emits a new list on every Drift table change. A background
+/// `playbackSessionPersister` write or a duration probe on a non-matching row
+/// re-sorts both halves and rebuilds every library-tab widget, even when the
+/// filtered + ordered lists are byte-for-byte identical to the previous
+/// emission. Dedupe on element equality of both halves to avoid that work.
+final libraryFilteredListsProvider =
+    StreamProvider<({List<Media> audio, List<Media> video})>((ref) {
+      final registry = ref.watch(mediaRegistryProvider);
+      final query = ref.watch(librarySearchProvider);
+      return combineLatest2(
+        registry.watchByKind(MediaKind.audio),
+        registry.watchByKind(MediaKind.video),
+        (List<Media> audio, List<Media> video) => (
+          audio: _filterMediaByQuery(audio, query),
+          video: _filterMediaByQuery(video, query),
+        ),
+      ).distinctBy((prev, next) {
+        return listEquals(prev.audio, next.audio) &&
+            listEquals(prev.video, next.video);
+      });
+    });
+
+List<Media> _filterMediaByQuery(List<Media> items, String query) {
+  if (query.isEmpty) return items;
+  final lower = query.toLowerCase();
+  return items.where((m) => m.title.toLowerCase().contains(lower)).toList();
+}

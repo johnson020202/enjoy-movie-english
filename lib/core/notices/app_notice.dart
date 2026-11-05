@@ -1,0 +1,313 @@
+/// In-app notices (Aurora toasts over SnackBars) with semantic glyphs and
+/// shell-aware margins.
+library;
+
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:enjoy_player/core/interaction/haptics.dart';
+import 'package:enjoy_player/core/logging/log.dart';
+import 'package:enjoy_player/core/notices/root_shell_bottom_inset.dart';
+import 'package:enjoy_player/core/player/player_surface_overlay_coordinator.dart';
+import 'package:enjoy_player/core/theme/colors.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+
+final _log = logNamed('AppNotice');
+
+/// Toast surface color for [AppNotice] in [brightness].
+Color appNoticeBackground(Brightness brightness) =>
+    brightness == Brightness.light
+    ? const Color(0xF516161D)
+    : const Color(0xFF2A2A33);
+
+/// Root [ScaffoldMessenger] so notices work from any [BuildContext] (e.g. hotkeys).
+final GlobalKey<ScaffoldMessengerState> appScaffoldMessengerKey =
+    GlobalKey<ScaffoldMessengerState>();
+
+enum _AppNoticeKind { success, error, info, warning }
+
+/// An action button rendered inside the notice body.
+///
+/// Deliberately not [SnackBarAction]: SnackBar's own action slot squeezes the
+/// message (see the note in [AppNotice._show]), and its label can neither
+/// ellipsize nor take the notice palette. The body renders the button itself;
+/// pressing it once fires [AppNoticeAction.onPressed] and dismisses the
+/// notice, like [SnackBarAction].
+typedef AppNoticeAction = ({String label, VoidCallback onPressed});
+
+/// Typed, theme-aware SnackBars for lightweight feedback.
+abstract final class AppNotice {
+  static void success(
+    BuildContext context,
+    String message, {
+    AppNoticeAction? action,
+  }) => _show(context, _AppNoticeKind.success, message, action: action);
+
+  static void error(
+    BuildContext context,
+    String message, {
+    AppNoticeAction? action,
+  }) => _show(context, _AppNoticeKind.error, message, action: action);
+
+  static void info(
+    BuildContext context,
+    String message, {
+    AppNoticeAction? action,
+  }) => _show(context, _AppNoticeKind.info, message, action: action);
+
+  /// Partial failures, warnings, or attention-worthy non-errors.
+  static void warning(
+    BuildContext context,
+    String message, {
+    AppNoticeAction? action,
+  }) => _show(context, _AppNoticeKind.warning, message, action: action);
+
+  static void _show(
+    BuildContext context,
+    _AppNoticeKind kind,
+    String message, {
+    AppNoticeAction? action,
+  }) {
+    if (!context.mounted) return;
+    if (appScaffoldMessengerKey.currentState == null &&
+        ScaffoldMessenger.maybeOf(context) == null) {
+      _log.warning(
+        'AppNotice skipped: no ScaffoldMessenger (global key unset and '
+        'ScaffoldMessenger.maybeOf(context) is null)',
+      );
+      return;
+    }
+
+    if (kind == _AppNoticeKind.success || kind == _AppNoticeKind.info) {
+      Haptics.success(context);
+    } else {
+      Haptics.warning(context);
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!context.mounted) return;
+      final m =
+          appScaffoldMessengerKey.currentState ??
+          ScaffoldMessenger.maybeOf(context);
+      if (m == null) {
+        _log.warning(
+          'AppNotice skipped after frame: ScaffoldMessenger no longer available',
+        );
+        return;
+      }
+
+      final theme = Theme.of(context);
+      final tokens = EnjoyThemeTokens.of(context);
+
+      final backgroundColor = appNoticeBackground(theme.brightness);
+      const foregroundColor = Color(0xFFF4F4F7);
+      late final Color iconColor;
+      late final IconData icon;
+      late final Duration duration;
+      late final bool wantsDismiss;
+
+      switch (kind) {
+        case _AppNoticeKind.success:
+          iconColor = const Color(0xFFF4F4F7);
+          icon = EnjoyIcons.checkCircleFill;
+          duration = const Duration(seconds: 3);
+          wantsDismiss = false;
+        case _AppNoticeKind.error:
+          iconColor = AppColors.dangerDark;
+          icon = EnjoyIcons.errorFill;
+          duration = const Duration(seconds: 5);
+          wantsDismiss = true;
+        case _AppNoticeKind.info:
+          iconColor = AppColors.brandOnDark;
+          icon = EnjoyIcons.infoFill;
+          duration = const Duration(seconds: 3);
+          wantsDismiss = false;
+        case _AppNoticeKind.warning:
+          iconColor = const Color(0xFFF4F4F7);
+          icon = EnjoyIcons.warning;
+          duration = const Duration(seconds: 4);
+          wantsDismiss = true;
+      }
+
+      if (kind == _AppNoticeKind.error || kind == _AppNoticeKind.warning) {
+        m.clearSnackBars();
+      }
+
+      final mq = MediaQuery.of(context);
+      final shellExtra = RootShellBottomInset.clearanceOf(context);
+      final horizontal = tokens.space16;
+      final safeBottom = math.min(mq.padding.bottom, mq.viewPadding.bottom);
+      final bottomPad = safeBottom + shellExtra + tokens.space16;
+      final maxW = mq.size.width;
+      final innerMax = math.max(0.0, maxW - horizontal * 2);
+      final snackMaxWidth = maxW >= 600 && innerMax > 0
+          ? math.min(520.0, innerMax)
+          : null;
+      final sideMargin = snackMaxWidth != null
+          ? math.max(horizontal, (maxW - snackMaxWidth) / 2)
+          : horizontal;
+
+      final radius = tokens.radiusLg;
+      final elevation = tokens.elevationModal;
+
+      final textStyle = theme.textTheme.bodyMedium?.copyWith(
+        color: foregroundColor,
+      );
+
+      var actionTriggered = false;
+      final bodyAction = action == null
+          ? null
+          : (
+              label: action.label,
+              onPressed: () {
+                if (actionTriggered) return;
+                actionTriggered = true;
+                action.onPressed();
+                m.hideCurrentSnackBar(reason: SnackBarClosedReason.action);
+              },
+            );
+
+      final overlayHold = _acquireOverlayHold(context);
+
+      final controller = m.showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          elevation: elevation,
+          shape: RoundedSuperellipseBorder(
+            borderRadius: BorderRadius.circular(radius),
+            side: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+          ),
+          backgroundColor: backgroundColor,
+          duration: duration,
+          persist: action != null,
+          margin: EdgeInsets.fromLTRB(sideMargin, 0, sideMargin, bottomPad),
+          padding: EdgeInsets.symmetric(horizontal: tokens.space16),
+          content: _AppNoticeBody(
+            icon: icon,
+            iconColor: iconColor,
+            message: message,
+            textStyle: textStyle,
+            foregroundColor: foregroundColor,
+            action: bodyAction,
+            onDismiss: wantsDismiss
+                ? () => m.hideCurrentSnackBar(
+                    reason: SnackBarClosedReason.dismiss,
+                  )
+                : null,
+          ),
+        ),
+      );
+
+      if (overlayHold != null) {
+        unawaited(controller.closed.whenComplete(overlayHold.release));
+      }
+    });
+  }
+
+  /// Captures the Riverpod container at show-time so release still works after
+  /// the calling [BuildContext] unmounts.
+  static ({VoidCallback release})? _acquireOverlayHold(BuildContext context) {
+    try {
+      final container = ProviderScope.containerOf(context, listen: false);
+      final coordinator = container.read(
+        playerSurfaceOverlayCoordinatorProvider.notifier,
+      );
+      final token = coordinator.acquire('notice');
+      return (release: () => coordinator.release(token));
+    } on Object {
+      return null;
+    }
+  }
+}
+
+/// Notice body: semantic icon and a full-width message. The dismiss button
+/// rides inline with the message while it is alone (SnackBar's own geometry),
+/// and moves into a trailing row beside the action otherwise — minus the 40%
+/// width reserve [SnackBar] hard-codes for overflowing actions.
+///
+/// Laid out here rather than through [SnackBar.action] /
+/// [SnackBar.showCloseIcon] so the message always owns the bar's full inner
+/// width — see the note in [AppNotice._show].
+class _AppNoticeBody extends StatelessWidget {
+  const _AppNoticeBody({
+    required this.icon,
+    required this.iconColor,
+    required this.message,
+    required this.textStyle,
+    required this.foregroundColor,
+    this.action,
+    this.onDismiss,
+  });
+
+  final IconData icon;
+  final Color iconColor;
+  final String message;
+  final TextStyle? textStyle;
+  final Color foregroundColor;
+  final AppNoticeAction? action;
+  final VoidCallback? onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final tokens = EnjoyThemeTokens.of(context);
+    final action = this.action;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(icon, color: iconColor, size: 20),
+            SizedBox(width: tokens.space12),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                child: Text(message, style: textStyle),
+              ),
+            ),
+            if (action == null && onDismiss != null) _dismissButton(context),
+          ],
+        ),
+        if (action != null)
+          Padding(
+            padding: EdgeInsets.only(top: tokens.space4, bottom: 14),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                Flexible(
+                  child: TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor: AppColors.brandOnDark,
+                      padding: EdgeInsets.symmetric(horizontal: tokens.space8),
+                    ),
+                    onPressed: action.onPressed,
+                    child: Text(
+                      action.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+                if (onDismiss != null) _dismissButton(context),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// Same affordance as SnackBar's built-in close icon: SDK semantics key,
+  /// 24dp glyph, `closeButtonTooltip`, and the default 48dp tap target.
+  Widget _dismissButton(BuildContext context) => IconButton(
+    key: StandardComponentType.closeButton.key,
+    tooltip: MaterialLocalizations.of(context).closeButtonTooltip,
+    onPressed: onDismiss,
+    icon: const Icon(EnjoyIcons.close),
+    iconSize: 18,
+    color: foregroundColor.withValues(alpha: 0.7),
+  );
+}

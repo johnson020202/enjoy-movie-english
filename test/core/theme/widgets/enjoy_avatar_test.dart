@@ -1,0 +1,170 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:enjoy_player/core/theme/app_theme.dart';
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/typography.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_avatar.dart';
+
+Widget _host(Widget child) => MaterialApp(
+  theme: buildAppTheme(Brightness.dark),
+  home: Scaffold(body: Center(child: child)),
+);
+
+Container _badgeContainer(WidgetTester tester) => tester.widget<Container>(
+  find
+      .descendant(
+        of: find.byType(EnjoyTierBadge),
+        matching: find.byType(Container),
+      )
+      .first,
+);
+
+EnjoyThemeTokens _tokens(WidgetTester tester) =>
+    EnjoyThemeTokens.of(tester.element(find.byType(EnjoyTierBadge)));
+
+void main() {
+  testWidgets('default badge rides the brand gradient with compact padding', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_host(const EnjoyTierBadge(label: 'Pro')));
+    await tester.pumpAndSettle();
+
+    final t = _tokens(tester);
+    final container = _badgeContainer(tester);
+    expect(
+      container.padding,
+      const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+    );
+    final decoration = container.decoration as ShapeDecoration;
+    expect(decoration.shape, const StadiumBorder());
+    expect(decoration.gradient, t.brand);
+    expect(decoration.color, isNull);
+
+    final text = tester.widget<Text>(find.text('Pro'));
+    expect(text.style?.color, Colors.white);
+    expect(text.style?.fontSize, 10.5);
+    expect(text.style?.fontWeight, FontWeight.w700);
+  });
+
+  testWidgets('muted badge swaps the brand gradient for a neutral fill', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _host(const EnjoyTierBadge(label: 'Lite', muted: true)),
+    );
+    await tester.pumpAndSettle();
+
+    final t = _tokens(tester);
+    final decoration = _badgeContainer(tester).decoration as ShapeDecoration;
+    expect(decoration.gradient, isNull);
+    expect(decoration.color, t.fill);
+    expect(tester.widget<Text>(find.text('Lite')).style?.color, isNotNull);
+  });
+
+  testWidgets('leading icon rides the label color', (tester) async {
+    await tester.pumpWidget(
+      _host(
+        const EnjoyTierBadge(
+          label: 'Recommended',
+          leading: EnjoyIcons.sparkleFill,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final icon = tester.widget<Icon>(find.byIcon(EnjoyIcons.sparkleFill));
+    expect(icon.size, 12);
+    expect(icon.color, Colors.white);
+  });
+
+  testWidgets('padding override and solid color drop the brand gradient', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _host(
+        const EnjoyTierBadge(
+          label: 'Current plan',
+          color: Color(0xFF3A2E55),
+          textColor: Color(0xFFEDE7FF),
+          padding: EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final container = _badgeContainer(tester);
+    expect(
+      container.padding,
+      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+    );
+    final decoration = container.decoration as ShapeDecoration;
+    expect(decoration.gradient, isNull);
+    expect(decoration.color, const Color(0xFF3A2E55));
+    expect(
+      tester.widget<Text>(find.text('Current plan')).style?.color,
+      const Color(0xFFEDE7FF),
+    );
+  });
+
+  testWidgets('shape override replaces the stadium pill', (tester) async {
+    const shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.all(Radius.circular(4)),
+    );
+    await tester.pumpWidget(
+      _host(const EnjoyTierBadge(label: 'Pro', shape: shape)),
+    );
+    await tester.pumpAndSettle();
+
+    final decoration = _badgeContainer(tester).decoration as ShapeDecoration;
+    expect(decoration.shape, shape);
+    expect(decoration.gradient, _tokens(tester).brand);
+  });
+
+  testWidgets('EnjoyKeycap renders mono on one tight line', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(_host(const EnjoyKeycap(label: 'Ctrl K')));
+
+    final text = tester.widget<Text>(find.text('Ctrl K'));
+    final ctx = tester.element(find.byType(EnjoyKeycap));
+    final tokens = EnjoyThemeTokens.of(ctx);
+    final mono = enjoyMonoStyle(
+      ctx,
+      size: 10.5,
+      weight: FontWeight.w500,
+      color: tokens.ink,
+      height: 1,
+    );
+    expect(text.style?.fontFamily, mono.fontFamily);
+    expect(text.style, mono);
+    expect(text.maxLines, 1);
+  });
+
+  testWidgets('EnjoyKeycap fits the 34px slot the sidebar search gives it', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(Brightness.light),
+        home: const Scaffold(
+          body: Center(
+            child: SizedBox(
+              height: 34,
+              width: 120,
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: EnjoyKeycap(label: 'Ctrl K'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(tester.getSize(find.byType(EnjoyKeycap)).height, lessThan(34));
+  });
+}

@@ -1,0 +1,53 @@
+# ADR-0065: Enjoy modals use the root navigator by default
+
+## Status
+
+Accepted
+
+## Context
+
+ADR-0057 mounts a permanent `PlayerSurfaceHost` as a sibling **above** the
+shell UI stack inside `RootShell`. Flutter dialogs and modal bottom sheets that
+use the nearest (shell) navigator therefore paint **under** the YouTube /
+media_kit platform view. That repeatedly covered player-context UI
+(dictionary lookup, practice poster, pronunciation assessment results, subtitle
+picker, playback rate sheet).
+
+Call-site opt-in (`useRootNavigator: true`) fixed individual sheets but
+regressed whenever a new Enjoy modal opened from the player without the flag.
+
+## Decision
+
+1. [`showEnjoySheet`](../../lib/core/theme/widgets/enjoy_modal.dart),
+   `showEnjoyDialog`, `showEnjoyAlertDialog`, and `showEnjoyAdaptiveSheet`
+   default `useRootNavigator` to **`true`** so Enjoy modals clear the permanent
+   surface host.
+2. Pass `useRootNavigator: false` only for intentional shell-scoped
+   presentation (rare).
+3. Prefer Enjoy modal helpers over raw `showDialog` /
+   `showModalBottomSheet` on player paths so the default applies.
+4. Keep distinct patterns for non-modal chrome:
+   - In-stage controls → `PlayerSurfaceTarget.overlayBuilder`
+   - Route stacked over a mounted player page → `PlayerSurfaceHost(forcePark: …)`
+     (competing WebView routes like `/youtube/login`, and player sub-routes like
+     the transcript editor that the surface would otherwise cover)
+5. On platforms where native surfaces punch through Flutter overlays (notably
+   Windows WebView2), [ADR-0066](0066-park-player-surface-for-overlays.md)
+   additionally parks the host for the lifetime of popup routes and
+   `AppNotice` snackbars.
+
+## Consequences
+
+- New Enjoy modals stay above YouTube without per-call flags.
+- Escape dismissal already checks shell then root
+  ([hotkeys.md](../features/hotkeys.md)); root-presented modals remain
+  dismissible.
+- Supplements [ADR-0057](0057-permanent-player-surface-host.md); complemented
+  by [ADR-0066](0066-park-player-surface-for-overlays.md) for native z-order.
+
+## Related
+
+- [ADR-0057](0057-permanent-player-surface-host.md)
+- [ADR-0066](0066-park-player-surface-for-overlays.md)
+- [player.md](../features/player.md)
+- [architecture.md](../architecture.md)

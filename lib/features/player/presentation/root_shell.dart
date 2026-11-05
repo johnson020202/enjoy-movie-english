@@ -1,0 +1,253 @@
+/// Application shell: adaptive navigation + page stack + player-route transport.
+library;
+
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import 'package:enjoy_player/core/notices/root_shell_bottom_inset.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/widgets/app_background.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_bottom_nav.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_chrome_icon.dart';
+import 'package:enjoy_player/features/onboarding/presentation/onboarding_showcase_host.dart';
+import 'package:enjoy_player/features/player/application/player_controller.dart';
+import 'package:enjoy_player/features/player/domain/playback_session.dart';
+import 'package:enjoy_player/features/player/presentation/widgets/player_dock.dart';
+import 'package:enjoy_player/features/subscription/presentation/tier_reconcile_host.dart';
+import 'package:enjoy_player/features/sync/application/sync_controller.dart';
+import 'package:enjoy_player/features/discover/application/discover_providers.dart';
+import 'package:enjoy_player/features/update/application/update_controller.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+import 'widgets/app_sidebar.dart';
+import 'widgets/player_surface_host.dart';
+
+class RootShell extends ConsumerStatefulWidget {
+  const RootShell({required this.child, super.key});
+
+  final Widget child;
+
+  @override
+  ConsumerState<RootShell> createState() => _RootShellState();
+}
+
+class _RootShellState extends ConsumerState<RootShell> {
+  static const _navHome = 0;
+  static const _navDiscover = 1;
+  static const _navLibrary = 2;
+  static const _navAccount = 3;
+
+  static const _accountPrefixes = {
+    '/profile',
+    '/settings',
+    '/subscription',
+    '/credits',
+    '/vocabulary',
+  };
+
+  int _navIndexForPath(String path) {
+    if (_accountPrefixes.any(path.startsWith)) return _navAccount;
+    if (path.startsWith('/library') || path.startsWith('/cloud')) {
+      return _navLibrary;
+    }
+    if (path.startsWith('/discover')) return _navDiscover;
+    return _navHome;
+  }
+
+  void _goNavIndex(BuildContext context, int index) {
+    switch (index) {
+      case _navHome:
+        context.go('/');
+        return;
+      case _navDiscover:
+        context.go('/discover');
+        return;
+      case _navLibrary:
+        context.go('/library');
+        return;
+      case _navAccount:
+        context.go('/profile');
+        return;
+      default:
+        context.go('/');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.watch(syncCtrlProvider);
+    ref.watch(discoverFeedRefreshSchedulerProvider);
+    final chrome = ref.watch(playerControllerProvider.select(playbackChromeOf));
+    final sessionActive = chrome != null;
+    final updateBadge = ref.watch(updateAvailableBadgeProvider);
+    final l10n = AppLocalizations.of(context)!;
+    final path = GoRouterState.of(context).uri.path;
+    final onPlayer = path.startsWith('/player/');
+    final onReview = path.startsWith('/vocabulary/review');
+
+    return OnboardingShowcaseHost(
+      child: TierReconcileHost(
+        child: Builder(
+          builder: (context) => LayoutBuilder(
+            builder: (context, constraints) {
+              final tokens = EnjoyThemeTokens.of(context);
+              final useSidebar =
+                  constraints.maxWidth >= tokens.breakpointRail &&
+                  !onPlayer &&
+                  !onReview;
+
+              final bottomNav = (!useSidebar && !onPlayer && !onReview)
+                  ? EnjoyBottomNav(
+                      selectedIndex: _navIndexForPath(path),
+                      onDestinationSelected: (i) => _goNavIndex(context, i),
+                      destinations: [
+                        EnjoyBottomNavDestination(
+                          icon: EnjoyIcons.home,
+                          selectedIcon: EnjoyIcons.homeFill,
+                          iconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.home,
+                          ),
+                          selectedIconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.home,
+                            filled: true,
+                          ),
+                          label: l10n.homeTitle,
+                        ),
+                        EnjoyBottomNavDestination(
+                          icon: EnjoyIcons.compass,
+                          selectedIcon: EnjoyIcons.compassFill,
+                          iconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.compass,
+                          ),
+                          selectedIconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.compass,
+                            filled: true,
+                          ),
+                          label: l10n.discoverTitle,
+                        ),
+                        EnjoyBottomNavDestination(
+                          icon: EnjoyIcons.library,
+                          selectedIcon: EnjoyIcons.library,
+                          iconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.library,
+                          ),
+                          selectedIconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.library,
+                            filled: true,
+                          ),
+                          label: l10n.libraryTitle,
+                        ),
+                        EnjoyBottomNavDestination(
+                          icon: EnjoyIcons.person,
+                          selectedIcon: EnjoyIcons.personFill,
+                          iconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.user,
+                          ),
+                          selectedIconWidget: const EnjoyChromeIcon(
+                            EnjoyChromeGlyph.user,
+                            filled: true,
+                          ),
+                          label: l10n.profileTitle,
+                          showBadge: updateBadge,
+                          semanticsLabel: updateBadge
+                              ? '${l10n.profileTitle}, ${l10n.updateAvailableBadgeSemantics}'
+                              : null,
+                        ),
+                      ],
+                    )
+                  : null;
+
+              /// `/player/...` nests a [Scaffold] inside the route. Keeping transport in a
+              /// [Column] + [Expanded] sibling can yield **zero** body height on some mobile
+              /// frames (nested scaffold / safe-area constraint propagation), which pins the
+              /// bar under the status bar and hides video + transcript. [Scaffold] reserves
+              /// space via [bottomNavigationBar] instead.
+              final playerWithTransport = sessionActive && onPlayer;
+
+              final bottomClearance = !useSidebar && !onPlayer && !onReview
+                  ? rootShellBottomNavClearance(context)
+                  : 0.0;
+
+              Widget mobileShellScaffold() {
+                if (playerWithTransport) {
+                  return Scaffold(
+                    backgroundColor: Colors.transparent,
+                    extendBody: true,
+                    body: SafeArea(
+                      bottom: false,
+                      child: SizedBox.expand(child: widget.child),
+                    ),
+                    bottomNavigationBar: Material(
+                      type: MaterialType.transparency,
+                      child: PlayerDock(chrome: chrome),
+                    ),
+                  );
+                }
+                return Scaffold(
+                  backgroundColor: Colors.transparent,
+                  extendBody: bottomNav != null,
+                  body: SafeArea(
+                    bottom: false,
+                    child: Padding(
+                      key: const ValueKey<String>('root-shell-content'),
+                      padding: EdgeInsets.only(bottom: bottomClearance),
+                      child: widget.child,
+                    ),
+                  ),
+                  bottomNavigationBar: bottomNav == null
+                      ? null
+                      : Material(
+                          type: MaterialType.transparency,
+                          child: bottomNav,
+                        ),
+                );
+              }
+
+              final shell = useSidebar
+                  ? RootShellBottomInset(
+                      bottomClearance: bottomClearance,
+                      child: ColoredBox(
+                        color: tokens.canvas,
+                        child: Scaffold(
+                          backgroundColor: Colors.transparent,
+                          body: SafeArea(
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Semantics(
+                                  container: true,
+                                  label: l10n.navMainLabel,
+                                  child: const AppSidebar(),
+                                ),
+                                Expanded(child: widget.child),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                  : RootShellBottomInset(
+                      bottomClearance: bottomClearance,
+                      child: AppBackground(child: mobileShellScaffold()),
+                    );
+
+              final parkSurface =
+                  path.startsWith('/youtube/login') ||
+                  (onPlayer &&
+                      GoRouterState.of(context).uri.pathSegments.length > 2);
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  shell,
+                  PlayerSurfaceHost(forcePark: parkSurface),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}

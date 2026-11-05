@@ -1,0 +1,104 @@
+name: Codegen drift
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - "lib/**"
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "mise.toml"
+      - ".github/actions/setup-flutter/**"
+      - ".github/scripts/check_codegen_drift.sh"
+      - ".github/scripts/validate_ci_gates.sh"
+      - ".github/workflows/codegen_drift.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Cache misses must not reach pub.dev / storage.googleapis.com through the
+# per-GB proxy; these mirrors are routed DIRECT. pubspec.lock pins every
+# package by sha256, so a mirror serving different bytes fails the hash check.
+env:
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
+permissions:
+  contents: read
+
+jobs:
+  # Required status checks must always report, so this workflow triggers on
+  # every PR and this job decides whether the real job has work to do. A
+  # skipped job counts as passing; an API error counts as relevant (fail-safe:
+  # never skip silently). Push events keep their trigger-level path filter.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-slim
+    permissions:
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.diff.outputs.relevant }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PATTERN: '^(lib/|packages/|pubspec\.(yaml|lock)$|mise\.toml$|\.github/actions/setup-flutter/|\.github/scripts/(check_codegen_drift|validate_ci_gates)\.sh$|\.github/workflows/codegen_drift\.yml$)'
+        run: |
+          if ! files="$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')"; then
+            echo "::warning::Could not list PR files; running the checks."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -Eq "$PATTERN" <<<"$files"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No matching paths changed; the check will be skipped."
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  check:
+    name: Codegen drift
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, Linux, ci]
+    steps:
+      - uses: actions/checkout@v6
+
+      # The job's inner environment is reset to a pristine state before each
+      # run, so ~/.pub-cache cannot persist on the runner between jobs. The
+      # cache backend is the LAN gh-sr-cache server: a hit costs zero proxy
+      # bytes, and only a miss re-uploads.
+      - name: Restore pub cache
+        id: pub-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Save pub cache
+        if: steps.pub-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: ${{ steps.pub-cache.outputs.cache-primary-key }}
+
+      - uses: ./.github/actions/setup-flutter
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Verify no codegen drift
+        run: bash .github/scripts/check_codegen_drift.sh

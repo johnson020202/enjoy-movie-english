@@ -1,0 +1,83 @@
+# Feature: Echo mode (shadow reading)
+
+## MVP behavior
+
+- **Echo is one of three exclusive lenses** (Listen · Echo · Dictate, canvas v30): turning Echo on leaves Dictate (hide text) and turning Dictate on leaves Echo — `PlayerInteractions.toggleEcho` / `toggleBlur` / `selectLens`. A session persisted with both flags (before v30) reopens in Echo.
+- Echo region stores line indices + start/end times (seconds). The line indices are the source of truth; the cached seconds are re-derived from the current transcript at enforcement time (falling back to the cached value when no transcript is loaded), so a re-segmented transcript yields fresh boundaries.
+- `normalizeEchoWindow`, `clampSeekTimeToEchoWindow`, `decideEchoPlaybackTime` match web `echo-utils.ts` semantics (segment end **pauses** and rewinds to segment start for replay — not auto-loop).
+- `normalizeEchoWindow` also widens windows narrower than `endGuard + seekEpsilon`: such a window has no playable position — the end guard fires pause-and-rewind the instant the rewind-to-start seek lands, looping seek → pause → seek (issue #659; reachable via arbitrary start/end query params or a sub-40 ms cue). Media too short for even the minimum drops the window instead of churning enforcement.
+- Open-time poster capture is skipped when a session restores to position 0 with echo active: the capture seek would be corrected back into the echo window by the live enforcer, capturing the wrong frame and pausing/churning playback right after open (issue #659). A later open without echo still captures.
+- `PlayerController` applies clamp / pause-and-rewind while echo active. The reactive per-tick correction and the proactive seek clamp are serialized through one [`EchoEnforcer`](../../lib/features/player/application/echo_enforcer.dart) — a single in-flight seek/pause at a time so they can't interleave. Enforcement runs on every position event, so the segment-end pause-and-rewind fires within ~50 ms of the boundary (not deferred to the 400 ms session-emit bucket).
+- State persisted in `echo_sessions` (latest session per `targetType` + `targetId`). Position is durably written mid-playback: the [`PlaybackSessionPersister`](../../lib/features/player/application/playback_session_persister.dart) coalesces updates on a 450 ms debounce but forces a flush once pending data is older than ~2 s, so a crash never loses more than ~2 s of progress at any playback rate.
+- **Shadow reading**: below the echo region, [`ShadowReadingPanel`](../../lib/features/shadow_reading/presentation/shadow_reading_panel.dart) supports mic recording (saved to `recordings`); optional **pitch contour** analysis (FFmpeg PCM extract + YIN envelope — see `shadow_reading/`), `PitchContourSection` can be **parent-driven** (`expanded` / `showHeader: false` for chart-only body). The player embed renders the **takes strip** + dock-owned record controls (see *Presentation* below); the vocabulary embed keeps the **idle toolbar** (pitch icon, centered FAB, play + **pronunciation assess** + more **grouped at center** — delete in more menu with **confirm dialog**) and **recording-only focus** (FAB + countdown vs segment; pitch/takes hidden).
+- **Transcript**: while echo is active, only cues inside the current echo segment show the “active line” highlight (avoids gap/overlap confusing a cue outside the brown region). Tapping another cue still seeks/plays from that cue and recenters the echo segment on it (`PlayerInteractions._seekLine`).
+- **Pronunciation assessment**: Enjoy Worker Azure token + native `azure_speech` assessment; results stored in `pronunciation_score` + `assessment_json` on the recording row, queued for metadata sync. The takes-toolbar **score badge** ([`RecordingAssessmentButton`](../../lib/features/shadow_reading/presentation/recording_assessment_button.dart)) — sparkle glyph when unscored, mono score when scored, spinner while assessing — runs assessment when no stored JSON exists and re-opens the stored result otherwise, via Enjoy modals on the **root** navigator so results clear the YouTube surface host ([ADR-0065](../decisions/0065-enjoy-modals-root-navigator.md)); in the player the result prefers the D3.8 side **margin** at ≥ 600px ([ADR-0093](../decisions/0093-duet-design-language.md), [`assessment_margin.dart`](../../lib/features/shadow_reading/presentation/assessment_margin.dart)), with the [`AssessmentResultDialog`](../../lib/features/shadow_reading/presentation/assessment_result_dialog.dart) / sheet pair below it. Take rows show per-take scores and **Re-assess** when the current take already has JSON. **Languages**: Azure locale comes from the recording/media language via [`resolveAzureAssessmentLocaleForPractice`](../../lib/core/application/app_language_catalog.dart). Unknown media tags (`und`, empty — common for YouTube imports) fall back to the learner's focus language; real unsupported languages still disable the control with an explanatory tooltip. **Touch / a11y**: idle pitch / play / overflow controls use **≥44×44** hit targets where possible; the assessment badge control is **44×44** with explicit **Semantics** (label + button). The takes cluster is wrapped in `FittedBox(scaleDown)` so play / assess / menu stay inside the half-width hit box on narrow phones.
+- **Microphone selection**: the recorder reads its capture device from [`recordingInputDeviceCtrlProvider`](../../lib/features/shadow_reading/application/recording_input_device_controller.dart) and passes it to [`RecordConfig.device`](../../lib/features/shadow_reading/presentation/shadow_reading_panel.dart) on every take. Settings → **Recording → Microphone** opens a picker (`Auto` plus every device returned by `AudioRecorder.listInputDevices()`); the choice is persisted to [`SettingsKeys.prefsRecordingInputDeviceId`](../../lib/data/db/settings_keys.dart). When no preference is set, [`pickPreferredInputDeviceId`](../../lib/features/shadow_reading/application/recording_input_device_picker.dart) skips known **virtual / loopback / shared-audio** capture devices (GlideX, VoiceMeeter, VB-Audio CABLE, Stereo Mix, NVIDIA Broadcast, …) so Windows defaults like *GlideX Shared Audio* don't silently capture only zeros.
+- **Share practice poster**: when the open media has at least one local recording **and** echo mode is active, the **top bar** shows the **Share** pill ([`SharePracticePosterButton`](../../lib/features/share_poster/presentation/share_practice_poster_button.dart)) next to Subtitles (icon + label from 1100px, per the Duet board). It opens a preview sheet ([`PracticePosterPreviewSheet`](../../lib/features/share_poster/presentation/practice_poster_preview_sheet.dart)) with a **9:16** branded poster (cover, title, hero line, takes / sentences / spoken stats, QR to `https://player.enjoy.bot`). **iOS / Android** export via the system share sheet (`share_plus`, e.g. WeChat); **Windows / macOS** save PNG via file picker. The poster is **echo-tailored**: the cover uses the live video frame captured from the active echo region (with a YouTube WebView fallback), and the hero quote is resolved from the echo region's transcript lines with ellipsis on cut — see [`share-poster.md`](share-poster.md). The share pill is **not** rendered in the top bar while echo mode is off; users who want to share earlier takes enter echo mode first (or rely on the share entry on Library rows) — see [ADR-0068](../decisions/0068-shadow-toolbar-share-button.md). The vocabulary embed's toolbar keeps its own share entry.
+
+- **Export the loop as a clip** (canvas v30): with a loop active, the player's ⋯ More menu gains a **Media** group whose **“Export the loop as a clip…”** entry saves the loop's time range as a standalone media file — video rows re-encode to **MP4** (H.264 + AAC), audio rows to **M4A** (AAC), re-encoded rather than stream-copied so the cut points are exact instead of keyframe-snapped. The range mirrors the enforcer's derivation (`resolveLoopClipRange` in [`loop_clip_export_plan.dart`](../../lib/features/player/application/loop_clip_export_plan.dart): transcript line bounds win over the cached seconds, then `normalizeEchoWindow` clamps to the media duration), and the FFmpeg invocation is the standard split — **FFmpeg CLI** on Windows / Linux (bundled with the app; missing CLI surfaces a dedicated "FFmpeg isn't available" notice), **FFmpegKit** on Android / iOS / macOS ([`loop_clip_export_runner.dart`](../../lib/features/player/application/loop_clip_export_runner.dart), injectable `runFfmpeg` seam). The entry is **enabled** only while a loop is active *and* the open media resolves to a direct source FFmpeg can read — a trusted local file, a macOS security-scoped bookmark, or a direct media URL (`resolvePlayableSourceUri`; YouTube pages have none and stay disabled, as do items whose local file moved away); the row renders dimmed otherwise. **Desktop** (Windows / Linux / macOS) asks where to save via the file picker (`FilePicker.saveFile`, extension re-appended if the dialog drops it, `-f mp4` / `-f ipod` pinned so encoding never depends on the chosen name); **iOS / Android** run to a temp file and hand it to the system share sheet — the same save-dialog-vs-share-sheet split as the diagnostic report export. Direct media URLs are passed to FFmpeg with the shared `file,http,https,tcp,tls,crypto` protocol whitelist. Feedback is `AppNotice` success / failure; every failure reason is typed (`LoopClipExportException`) with a 120 s per-export timeout.
+
+
+## Future
+
+- Multi-line echo regions with draggable selection UI.
+
+
+## Presentation — the Echo lens (Duet, ADR-0093)
+
+The loop block stands on the ground inside you-colored corner brackets
+(20px arms, 10px outer radius; 22 / 9 on phones — no full border). The section gutter
+shows the loop start time once (mono, you-ink) next to a
+localized overline (`LOOP · LINE n · x.x S` in English — the
+`echoLoopCaptionLine` / `echoLoopCaptionLines` ARB strings, so the
+wording and `S` unit are placeholders, not fixed literals); loop lines
+carry no gutter chrome of their own. Loop lines grow in place: Literata
+500 sized by the board —
+one line clamps 22–28px with viewport width, two lines 20–24, three or
+more 19; the video column uses 20/18 and phones 23/20. The video column
+and phones drop the loop's time gutter, and the takes strip aligns with
+the loop text (66px inset on desktop). The
+line just above the loop and the line just below it are **“+ line”
+rows** (canvas v30, `EchoLoopEdgeRow`): a dashed `shape` outline with a
+violet “+” chip and the line's text, which adds that line to the loop
+(`[` / `]`, `expandEchoBackward` / `expandEchoForward`), and a “−” button
+beside it that drops the loop's first / last line (`{` / `}`,
+`shrinkEchoBackward` / `shrinkEchoForward`; disabled on a one-line
+loop). Order is: + row above, loop, + row below, takes. The rows hide
+while a take records. They replaced the Earlier / Later pill handles on
+the bracket edges. Neighbour lines fade by distance through `echoLensOpacity`
+(0.65 / 0.35 / 0.2) at the board's lens sizes (16 / 15 / 14
+desktop, 14.5 / 13.5 in the video column and on phones) and restore to full ink on hover. While a take is recording,
+the label swaps to a pulsing dot plus the localized recording caption
+(`RECORDING TAKE n` in English — `echoLoopCaptionRecording`), and a 4px
+progress bar with the localized countdown caption runs under the loop
+lines. The old merged card's side rail, surface shell, in-card
+dividers, and active-line plate are gone; lines sit flat inside the
+brackets.
+
+### Takes row and dock (player embed)
+
+In the player, the panel below the loop renders as the board's takes
+summary row ([`ShadowTakeSummaryRow`](../../lib/features/shadow_reading/presentation/widgets/shadow_take_summary_row.dart))
+instead of the idle toolbar: play/pause for the selected take, its name
+and score (an unscored take reads `Not scored yet · tap to score`, or
+`… · click to score` on pointer devices, and tapping runs the
+assessment), and a `3 takes ›` affordance that opens the takes list.
+With no takes it shows the empty hint: on phones the short
+`No recordings for this segment yet.` line, on pointer devices the same
+sentence with the `R` keycap and `and say it back.` appended. The row
+hides while a take records.
+
+`3 takes ›` opens [`ShadowTakesListPanel`](../../lib/features/shadow_reading/presentation/widgets/shadow_takes_list_panel.dart):
+as a bottom sheet below `breakpointCompact` (600 px), otherwise in the
+player margin. The panel lists the takes newest-first; each row
+carries the take number, a play control, the duration in mono and a
+trailing score chip (the score, or a **Score** action that runs the
+assessment), plus a per-take **delete with the
+`confirmShadowDeleteTake` confirmation dialog** (decision R2, built in
+D6.3), with the selected take highlighted. A pitch toggle shows/hides
+the collapsible pitch-contour section under the takes row
+(`loopPitchVisibleProvider`, also the `P` hotkey). Record / cancel /
+stop live in the dock (Play/Pause + record group; Cancel + Stop
+while recording). The vocabulary "Echo reading" embed keeps the
+centered-FAB toolbar with its take menu.

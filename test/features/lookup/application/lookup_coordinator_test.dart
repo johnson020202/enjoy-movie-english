@@ -1,0 +1,156 @@
+import 'dart:async';
+
+import 'package:drift/native.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/app_database_provider.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/domain/auth_state.dart';
+import 'package:enjoy_player/features/lookup/application/lookup_coordinator.dart';
+import 'package:enjoy_player/features/lookup/domain/lookup_request.dart';
+import 'package:enjoy_player/features/lookup/presentation/dictionary_lookup_sheet.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+class _AuthSignedOutCtrl extends AuthCtrl {
+  @override
+  Future<AuthState> build() async => const AuthSignedOut();
+}
+
+Widget _wrap({
+  required AppDatabase db,
+  required AuthCtrl authCtrl,
+  required Size size,
+  required List<Override> extraOverrides,
+}) {
+  final scheme = ColorScheme.fromSeed(
+    seedColor: const Color(0xFF7B61FF),
+    brightness: Brightness.dark,
+  );
+  return ProviderScope(
+    overrides: [
+      appDatabaseProvider.overrideWithValue(db),
+      authCtrlProvider.overrideWith(() => authCtrl),
+      ...extraOverrides,
+    ],
+    child: MaterialApp(
+      theme: ThemeData(
+        colorScheme: scheme,
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        extensions: [EnjoyThemeTokens.build(scheme)],
+      ),
+      locale: const Locale('en', 'US'),
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: MediaQuery(
+        data: MediaQueryData(size: size),
+        child: Scaffold(
+          body: Consumer(
+            builder: (context, ref, _) {
+              return Center(
+                child: ElevatedButton(
+                  onPressed: () {
+                    final req = const LookupRequest(
+                      selectedText: 'hello',
+                      sourceLanguage: 'en',
+                      targetLanguage: 'zh',
+                    );
+                    unawaited(
+                      ref
+                          .read(lookupCoordinatorProvider.notifier)
+                          .open(context, req),
+                    );
+                  },
+                  child: const Text('OpenLookup'),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late AppDatabase db;
+
+  setUp(() {
+    db = AppDatabase(executor: NativeDatabase.memory());
+  });
+
+  tearDown(() async {
+    await db.close();
+  });
+
+  testWidgets('LookupCoordinator.build initializes to 0', (tester) async {
+    final container = ProviderContainer(
+      overrides: [appDatabaseProvider.overrideWithValue(db)],
+    );
+    addTearDown(container.dispose);
+    expect(container.read(lookupCoordinatorProvider), 0);
+  });
+
+  for (final entry in <(String, Size, DictionaryLookupPresentation)>[
+    (
+      'narrow 500x800',
+      const Size(500, 800),
+      DictionaryLookupPresentation.bottomSheet,
+    ),
+    (
+      'just below compact 599x800',
+      const Size(599, 800),
+      DictionaryLookupPresentation.bottomSheet,
+    ),
+    (
+      'compact 600x800',
+      const Size(600, 800),
+      DictionaryLookupPresentation.dialog,
+    ),
+    ('rail 900x800', const Size(900, 800), DictionaryLookupPresentation.dialog),
+    (
+      'wide 1200x900',
+      const Size(1200, 900),
+      DictionaryLookupPresentation.dialog,
+    ),
+  ]) {
+    testWidgets('open() uses ${entry.$3.name} at ${entry.$1}', (tester) async {
+      await tester.pumpWidget(
+        _wrap(
+          db: db,
+          authCtrl: _AuthSignedOutCtrl(),
+          size: entry.$2,
+          extraOverrides: const [],
+        ),
+      );
+      await tester.pump();
+
+      await tester.tap(find.text('OpenLookup'));
+      await tester.pumpAndSettle();
+
+      final sheetWidgets = tester
+          .widgetList(find.byType(DictionaryLookupSheet))
+          .toList();
+      expect(
+        sheetWidgets,
+        isNotEmpty,
+        reason: 'DictionaryLookupSheet should be rendered for ${entry.$1}',
+      );
+      final any = sheetWidgets.first as DictionaryLookupSheet;
+      expect(
+        any.presentation,
+        entry.$3,
+        reason:
+            'expected ${entry.$3.name} at viewport ${entry.$1}, got '
+            '${any.presentation.name}',
+      );
+    });
+  }
+}

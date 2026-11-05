@@ -1,0 +1,535 @@
+/// Home (the `Home` board): editorial header, the Continue practicing hero
+/// beside Today's goal and Community, then the Recent media grid.
+library;
+
+import 'package:enjoy_player/core/theme/widgets/enjoy_button.dart';
+import 'package:enjoy_player/core/theme/enjoy_icons.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
+
+import 'package:go_router/go_router.dart';
+
+import 'package:enjoy_player/core/interaction/enjoy_pressable.dart';
+import 'package:enjoy_player/core/presentation/relative_day_label.dart';
+import 'package:enjoy_player/core/theme/typography.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_card.dart';
+import 'package:enjoy_player/core/theme/widgets/error_state.dart';
+import 'package:enjoy_player/core/utils/sliver_key_index.dart';
+import 'package:enjoy_player/core/layout/enjoy_page_kind.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/widgets/editorial_header.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_page.dart';
+import 'package:enjoy_player/core/theme/widgets/media_card.dart';
+import 'package:enjoy_player/core/theme/widgets/skeleton.dart';
+import 'package:enjoy_player/features/auth/application/auth_controller.dart';
+import 'package:enjoy_player/features/auth/domain/auth_state.dart';
+import 'package:enjoy_player/features/community/presentation/community_activity_card.dart';
+import 'package:enjoy_player/features/library/application/continue_practice_provider.dart';
+import 'package:enjoy_player/features/library/presentation/continue_practice_card.dart';
+import 'package:enjoy_player/features/library/presentation/todays_goal_card.dart';
+import 'package:enjoy_player/features/onboarding/application/onboarding_controller.dart';
+import 'package:enjoy_player/features/onboarding/application/practice_tip_trigger.dart';
+import 'package:enjoy_player/features/onboarding/domain/onboarding_tip_id.dart';
+import 'package:enjoy_player/features/onboarding/presentation/onboarding_target.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+import '../application/library_media_provider.dart';
+import '../domain/media.dart';
+import 'library_actions.dart';
+import 'widgets/library_media_card.dart';
+
+class HomeScreen extends ConsumerStatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ref
+          .read(practiceTipTriggerProvider)
+          .startHomeEntries(routePath: GoRouterState.of(context).uri.path);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mediaAsync = ref.watch(libraryHomeRecentsProvider);
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+
+    return EnjoyPage(
+      kind: EnjoyPageKind.browse,
+      body: (context, metrics) {
+        final inset = metrics.horizontalInset;
+        return mediaAsync.when(
+          data: (recent) {
+            return CustomScrollView(
+              slivers: [
+                const SliverToBoxAdapter(child: _HomeHeader()),
+                SliverPadding(
+                  padding: EdgeInsets.fromLTRB(inset, t.space12, inset, 0),
+                  sliver: SliverToBoxAdapter(
+                    child: _HomeOverview(
+                      hasRecents: recent.isNotEmpty,
+                      width: metrics.paneWidth - metrics.horizontalInset * 2,
+                    ),
+                  ),
+                ),
+                if (recent.isNotEmpty) ...[
+                  SliverPadding(
+                    padding: EdgeInsets.fromLTRB(inset, 44, inset, 18),
+                    sliver: const SliverToBoxAdapter(
+                      child: _RecentMediaHeading(),
+                    ),
+                  ),
+                  SliverPadding(
+                    padding: EdgeInsets.symmetric(horizontal: inset),
+                    sliver: SliverLayoutBuilder(
+                      builder: (context, constraints) {
+                        return SliverGrid(
+                          gridDelegate:
+                              mediaCardTileGridDelegateForMinTileWidth(
+                                crossAxisExtent: constraints.crossAxisExtent,
+                                minTileWidth: _kRecentTileMinWidth,
+                                mainAxisSpacing: 24,
+                                crossAxisSpacing: 20,
+                              ),
+                          delegate: SliverChildBuilderDelegate(
+                            (context, index) {
+                              final m = recent[index];
+                              return Align(
+                                key: ValueKey<String>('home-media-${m.id}'),
+                                alignment: Alignment.topCenter,
+                                child: _HomeMediaTile(media: m),
+                              );
+                            },
+                            childCount: recent.length,
+                            findChildIndexCallback: (key) =>
+                                findSliverIndexByPrefixedId(
+                                  items: recent,
+                                  key: key,
+                                  prefix: 'home-media-',
+                                  idOf: (m) => m.id,
+                                ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+                const SliverToBoxAdapter(child: SizedBox(height: 72)),
+              ],
+            );
+          },
+          loading: () => _HomeLoadingScrollView(metrics: metrics),
+          error: (e, _) => ErrorState(
+            message: '${l10n.error}: $e',
+            onRetry: () => ref.invalidate(libraryHomeRecentsProvider),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Home layout while [libraryHomeRecentsProvider] has not emitted yet — mirrors the
+/// loaded scroll view except insight cards (Today's Goal / community), which
+/// mount only after the first media emission to avoid competing with the
+/// initial DB query.
+class _HomeLoadingScrollView extends ConsumerWidget {
+  const _HomeLoadingScrollView({required this.metrics});
+
+  final EnjoyPageMetrics metrics;
+
+  static const int _kSkeletonTileCount = 8;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+    final gutter = metrics.horizontalInset;
+
+    return SkeletonTickerHost(
+      child: CustomScrollView(
+        slivers: [
+          const SliverToBoxAdapter(child: _HomeHeader()),
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(gutter, t.space12, gutter, t.space12),
+            sliver: SliverToBoxAdapter(
+              child: EnjoySectionHeader(title: l10n.homeRecentMedia),
+            ),
+          ),
+          SliverPadding(
+            padding: EdgeInsets.symmetric(horizontal: gutter),
+            sliver: SliverLayoutBuilder(
+              builder: (context, gridConstraints) {
+                return SliverGrid(
+                  gridDelegate: mediaCardTileGridDelegateForMinTileWidth(
+                    crossAxisExtent: gridConstraints.crossAxisExtent,
+                    minTileWidth: _kRecentTileMinWidth,
+                    mainAxisSpacing: 24,
+                    crossAxisSpacing: 20,
+                  ),
+                  delegate: SliverChildBuilderDelegate(
+                    (context, index) => const _HomeRecentGridSkeletonTile(),
+                    childCount: _kSkeletonTileCount,
+                  ),
+                );
+              },
+            ),
+          ),
+          SliverToBoxAdapter(child: SizedBox(height: t.space24)),
+        ],
+      ),
+    );
+  }
+}
+
+/// Home editorial header — a time-of-day greeting under a date overline,
+/// with the Craft + Import actions (icon-only on narrow panes). Shared by the
+/// loaded and loading scroll views so both stay in sync.
+class _HomeHeader extends ConsumerWidget {
+  const _HomeHeader();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final now = DateTime.now();
+    final greeting = now.hour < 12
+        ? l10n.homeGreetingMorning
+        : now.hour < 18
+        ? l10n.homeGreetingAfternoon
+        : l10n.homeGreetingEvening;
+    final name = ref.watch(
+      authCtrlProvider.select(
+        (a) => a.maybeWhen(
+          data: (s) => s is AuthSignedIn ? s.profile.name.trim() : null,
+          orElse: () => null,
+        ),
+      ),
+    );
+    final firstName = (name == null || name.isEmpty)
+        ? null
+        : name.split(RegExp(r'\s+')).first;
+    final locale = Localizations.localeOf(context).toLanguageTag();
+    return EditorialHeader(
+      widthMode: EditorialHeaderWidthMode.browse,
+      overline: DateFormat.MMMMEEEEd(locale).format(now),
+      title: firstName == null
+          ? greeting
+          : l10n.homeGreetingNamed(greeting, firstName),
+      trailing: _HomeHeaderActions(
+        onCraft: () => context.push('/craft'),
+        onImport: (anchor) => showImportChooser(context, ref, anchor: anchor),
+      ),
+    );
+  }
+}
+
+/// Home header trailing actions — Craft entry + Import.
+class _HomeHeaderActions extends ConsumerWidget {
+  const _HomeHeaderActions({required this.onCraft, required this.onImport});
+
+  final VoidCallback onCraft;
+  final void Function(BuildContext? anchor) onImport;
+
+  void _act(WidgetRef ref, OnboardingTipId tip, VoidCallback action) {
+    unawaited(
+      ref.read(onboardingControllerProvider.notifier).onTargetActed(tip),
+    );
+    action();
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+    final narrow = MediaQuery.sizeOf(context).width < t.breakpointCompact;
+    void craft() => _act(ref, OnboardingTipId.homeCraft, onCraft);
+    void import(BuildContext anchor) =>
+        _act(ref, OnboardingTipId.homeImport, () => onImport(anchor));
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        OnboardingTarget(
+          tipId: OnboardingTipId.homeCraft,
+          onTargetAction: onCraft,
+          child: narrow
+              ? EnjoyIconButton(
+                  icon: EnjoyIcons.pencil,
+                  tooltip: l10n.homeCraftAction,
+                  onPressed: craft,
+                )
+              : EnjoyButton.secondary(
+                  icon: EnjoyIcons.pencil,
+                  onPressed: craft,
+                  child: Text(l10n.homeCraftAction),
+                ),
+        ),
+        SizedBox(width: t.space8),
+        OnboardingTarget(
+          tipId: OnboardingTipId.homeImport,
+          onTargetAction: () => onImport(null),
+          child: Builder(
+            builder: (anchor) => narrow
+                ? EnjoyIconButton(
+                    icon: EnjoyIcons.add,
+                    tooltip: l10n.actionImport,
+                    variant: EnjoyButtonVariant.brand,
+                    onPressed: () => import(anchor),
+                  )
+                : EnjoyButton.brand(
+                    icon: EnjoyIcons.add,
+                    onPressed: () => import(anchor),
+                    child: Text(l10n.actionImport),
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _HomeRecentGridSkeletonTile extends StatelessWidget {
+  const _HomeRecentGridSkeletonTile();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = EnjoyThemeTokens.of(context);
+    return LayoutBuilder(
+      builder: (context, c) {
+        final width = c.maxWidth.isFinite ? c.maxWidth : 0.0;
+        final artworkHeight = width * 9 / 16;
+        return ClipRSuperellipse(
+          borderRadius: BorderRadius.circular(t.radiusMd),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Skeleton.box(
+                width: width,
+                height: artworkHeight,
+                borderRadius: BorderRadius.zero,
+              ),
+              Padding(
+                padding: EdgeInsets.fromLTRB(
+                  t.space12,
+                  t.space8,
+                  t.space12,
+                  t.space12,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Skeleton.line(width: double.infinity, height: 14),
+                    SizedBox(height: t.space4),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Skeleton.line(width: 88, height: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+const double _kRecentTileMinWidth = 210;
+const double _kOverviewSplitMinWidth = 856;
+const double _kSideColumnMinWidth = 300;
+const double _kSideCardsPairMinWidth = 560;
+const double _kHeroStackBelow = 600;
+
+/// Continue practicing (or the empty-library card) beside Today's goal and
+/// Community; the side cards wrap below the hero on narrower panes. [width]
+/// is the band's content width from the page metrics.
+class _HomeOverview extends ConsumerWidget {
+  const _HomeOverview({required this.hasRecents, required this.width});
+
+  final bool hasRecents;
+  final double width;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final isSignedIn = ref.watch(authIsSignedInProvider);
+    final resume = ref.watch(continuePracticeResumeProvider);
+
+    final Widget? hero = resume != null
+        ? ContinuePracticeCard(
+            resume: resume,
+            stacked: width < _kHeroStackBelow,
+          )
+        : hasRecents
+        ? null
+        : const _HomeEmptyCard();
+    const goal = TodaysGoalCard();
+    const community = CommunityActivityCard(outerPadding: EdgeInsets.zero);
+
+    if (!isSignedIn) return hero ?? const SizedBox.shrink();
+
+    if (hero != null && width >= _kOverviewSplitMinWidth) {
+      return IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(flex: 165, child: hero),
+            const SizedBox(width: 20),
+            Expanded(
+              flex: 100,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(
+                  minWidth: _kSideColumnMinWidth,
+                ),
+                child: const Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [goal, SizedBox(height: 20), community],
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final side = width >= _kSideCardsPairMinWidth
+        ? const IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(child: goal),
+                SizedBox(width: 20),
+                Expanded(child: community),
+              ],
+            ),
+          )
+        : const Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [goal, SizedBox(height: 16), community],
+          );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (hero != null) ...[hero, const SizedBox(height: 20)],
+        side,
+      ],
+    );
+  }
+}
+
+class _HomeEmptyCard extends ConsumerWidget {
+  const _HomeEmptyCard();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+    final tt = Theme.of(context).textTheme;
+    return EnjoyCard(
+      radius: t.radiusCardLarge,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 34),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              l10n.homeEmptyTitle,
+              style: enjoyDisplayStyle(context, size: 24, color: t.ink),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              l10n.homeEmptyHint,
+              style: tt.bodyMedium?.copyWith(fontSize: 14.5, color: t.ink2),
+            ),
+            const SizedBox(height: 18),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                Builder(
+                  builder: (anchor) => EnjoyButton.brand(
+                    onPressed: () =>
+                        showImportChooser(context, ref, anchor: anchor),
+                    child: Text(l10n.actionImport),
+                  ),
+                ),
+                EnjoyButton.secondary(
+                  onPressed: () => context.go('/discover'),
+                  child: Text(l10n.discoverBrowseAction),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RecentMediaHeading extends StatelessWidget {
+  const _RecentMediaHeading();
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final t = EnjoyThemeTokens.of(context);
+    final tt = Theme.of(context).textTheme;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Expanded(
+          child: Text(
+            l10n.homeRecentMedia,
+            style: enjoyDisplayStyle(context, size: 24, color: t.ink),
+          ),
+        ),
+        EnjoyPressable(
+          onTap: () => context.go('/library'),
+          showHoverWash: false,
+          child: Text(
+            l10n.homeOpenLibrary,
+            style: tt.labelLarge?.copyWith(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w600,
+              color: t.brandInk,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _HomeMediaTile extends StatelessWidget {
+  const _HomeMediaTile({required this.media});
+
+  final Media media;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final isVideo = media.kind == MediaKind.video;
+    final locale = Localizations.localeOf(context).toLanguageTag();
+    final kind = isVideo
+        ? l10n.miniPlayerMediaVideo
+        : l10n.miniPlayerMediaAudio;
+
+    return LibraryMediaTile(
+      media: media,
+      subtitle: '$kind · ${relativeDayLabel(l10n, locale, media.updatedAt)}',
+      isVideo: isVideo,
+      heroArtworkMediaId: media.id,
+    );
+  }
+}

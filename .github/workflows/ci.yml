@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: main
+    paths:
+      - "lib/**"
+      - "test/**"
+      - "packages/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "analysis_options.yaml"
+      - "mise.toml"
+      - ".github/scripts/ensure_linux_tooling.sh"
+      - ".github/scripts/check_no_new_path_deps.sh"
+      - ".github/scripts/check_dart_format.sh"
+      - ".github/scripts/check_coverage_gate.sh"
+      - ".github/scripts/validate_ci_gates.sh"
+      - "tool/prefetch_sqlite3_libs.sh"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release_publish.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The runner pool sits behind a per-GB proxy, so a cache miss must not fall
+# back to pub.dev / storage.googleapis.com. These community mirrors are routed
+# DIRECT by the local OpenClash rules. pubspec.lock pins every package by
+# sha256, so a mirror that served different bytes would fail the hash check
+# rather than install a different package.
+env:
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
+permissions:
+  contents: read
+
+jobs:
+  # Required status checks must always report, so this workflow triggers on
+  # every PR and this job decides whether the real job has work to do. A
+  # skipped job counts as passing; an API error counts as relevant (fail-safe:
+  # never skip silently). Push events keep their trigger-level path filter.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-slim
+    permissions:
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.diff.outputs.relevant }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PATTERN: '^(lib/|test/|packages/|tool/prefetch_sqlite3_libs\.sh$|pubspec\.(yaml|lock)$|analysis_options\.yaml$|mise\.toml$|\.github/scripts/(ensure_linux_tooling|check_no_new_path_deps|check_dart_format|check_coverage_gate|validate_ci_gates)\.sh$|\.github/workflows/(ci|release_publish)\.yml$)'
+        run: |
+          if ! files="$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')"; then
+            echo "::warning::Could not list PR files; running the checks."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -Eq "$PATTERN" <<<"$files"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No matching paths changed; the check will be skipped."
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  analyze-test:
+    name: Analyze & test
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}
+    # PRs from outside the org (bots, Copilot, contributors) pause in
+    # ci-approval until a required reviewer approves; org-member PRs, push and
+    # workflow_dispatch resolve to the unprotected ci-direct and run freely.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["OWNER", "MEMBER"]'), github.event.pull_request.author_association) && 'ci-approval' || 'ci-direct' }}
+    runs-on: [self-hosted, Linux, ci]
+    # Format/analyze run in minutes; the covered app suite plus path-package
+    # suites land well under half an hour. 60 min only bites when a hung
+    # network or test process stalls the job (self-hosted has no default
+    # timeout).
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      # gh-sr resets the job's inner environment to a pristine state before
+      # every run (only the image cache survives), so ~/.pub-cache cannot be
+      # left on the runner's disk between jobs the way the Flutter SDK is.
+      # Restore it from the Actions cache instead; the cache backend is the
+      # LAN `gh-sr-cache` server, so a hit costs zero proxy bytes.
+      - name: Restore pub cache
+        id: pub-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      # Re-uploading ~1.3 GB on every exact hit would defeat the point, so only
+      # a miss (or a prefix-restore that filled in new packages) writes back.
+      - name: Save pub cache
+        if: steps.pub-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: ${{ steps.pub-cache.outputs.cache-primary-key }}
+
+      - name: Ensure Linux tooling
+        run: bash .github/scripts/ensure_linux_tooling.sh --skip-wpe
+
+      # mise pilot: install the Flutter pinned in the repo-root mise.toml
+      # (single source of truth for local dev and CI). Installs persist in
+      # ~/.local/share/mise across runs on this self-hosted runner, so the
+      # archive is fetched once per version bump — same property the
+      # setup-flutter action provides for the other workflows. mise-action is
+      # pinned by commit; `version` pins mise itself (matching the version
+      # preinstalled on the runner pool, so no self-update round-trip), and
+      # github_token keeps that self-update path working on the rare runs
+      # where the pool's mise has drifted.
+      - name: Setup Flutter (mise)
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          version: 2026.9.1
+          github_token: ${{ github.token }}
+          # The mise installs survive in the preserved image cache, so caching
+          # the SDK itself would only add a dependency on the cache service
+          # for an archive this pool already fetches once per version bump.
+          # The package cache restored above is a different story — it does
+          # not survive the per-job environment reset.
+          cache: false
+
+      # Keep this executable probe: it warms Flutter's lazy bootstrap cache
+      # before any read-only-mount window (see the note in
+      # .github/actions/setup-flutter/action.yml and #501).
+      - name: Flutter version probe
+        run: flutter --version
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # package:sqlite3 3.x downloads its prebuilt library from
+      # github.com/simolus3/sqlite3.dart/releases with Dart HttpClient (no
+      # retries), so a dropped TLS handshake fails the whole test run with
+      # "Building native assets failed". Prefetch into the dart_build shared
+      # cache with curl (which retries) so the hook reuses it. The Apple and
+      # Android paths prefetch the same way.
+      - name: Prefetch sqlite3 Linux native libs
+        run: |
+          bash tool/prefetch_sqlite3_libs.sh linux \
+            || echo "::warning::prefetch_sqlite3_libs skipped; the dart_build hook will fetch on its own"
+
+      - name: Forbid new local-path packages
+        run: bash .github/scripts/check_no_new_path_deps.sh
+
+      - name: Dart format
+        run: bash .github/scripts/check_dart_format.sh
+
+      - name: Flutter analyze
+        run: flutter analyze
+
+      - name: Flutter test (app, with coverage)
+        run: flutter test --coverage
+
+      # The relative-day label counts calendar days, and the 23-hour day a DST
+      # transition creates is what breaks that count. The runner's default zone
+      # may observe no DST (UTC), where the case skips itself — so run it in a
+      # DST zone, and REQUIRE_DST_TIMEZONE turns that skip into a failure so a
+      # runner without tzdata cannot silently skip the case.
+      - name: Flutter test (calendar labels under a DST timezone)
+        env:
+          TZ: America/New_York
+          REQUIRE_DST_TIMEZONE: '1'
+        run: flutter test test/core/presentation/relative_day_label_test.dart
+
+      - name: Coverage gate (line baseline)
+        run: bash .github/scripts/check_coverage_gate.sh coverage/lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/lcov.info
+          fail_ci_if_error: false
+
+      - name: Flutter test (path packages)
+        run: |
+          set -euo pipefail
+          for pkg in packages/*/; do
+            if [ -d "${pkg}test" ]; then
+              (cd "$pkg" && flutter pub get && flutter test)
+            fi
+          done

@@ -1,0 +1,213 @@
+/// The player's ⋯ More menu (Duet v30): the transcript actions, the Media
+/// group (Edit details, loop clip export), and the keyboard shortcuts
+/// cheatsheet, anchored
+/// under the top bar's More button.
+library;
+
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:enjoy_player/core/interaction/enjoy_pressable.dart';
+import 'package:enjoy_player/core/riverpod/async_value_x.dart';
+import 'package:enjoy_player/core/theme/enjoy_tokens.dart';
+import 'package:enjoy_player/core/theme/widgets/anchored_popover_route.dart';
+import 'package:enjoy_player/core/theme/widgets/editorial_header.dart';
+import 'package:enjoy_player/core/theme/widgets/enjoy_avatar.dart';
+import 'package:enjoy_player/features/hotkeys/presentation/hotkeys_help_dialog.dart';
+import 'package:enjoy_player/features/library/presentation/edit_media_details.dart';
+import 'package:enjoy_player/features/player/application/loop_clip_export_availability.dart';
+import 'package:enjoy_player/features/player/presentation/loop_clip_export_flow.dart';
+import 'package:enjoy_player/features/transcript/presentation/transcript_actions.dart';
+import 'package:enjoy_player/l10n/app_localizations.dart';
+
+const double _menuWidth = 284;
+const double _menuTop = 56;
+const double _menuRight = 14;
+
+/// Opens the More menu as a [PopupRoute] so a video surface parks under it.
+/// The chosen action runs against [context] once the menu has closed.
+Future<void> showPlayerMoreMenu(BuildContext context, String mediaId) async {
+  final choice = await Navigator.of(context, rootNavigator: true).push(
+    AnchoredPopoverRoute<PlayerMenuChoice>(
+      barrierLabel: 'More',
+      insets: (context) =>
+          const EdgeInsets.only(top: _menuTop, right: _menuRight),
+      slideOffset: const Offset(0, -0.02),
+      builder: (context) => PlayerMoreMenuPanel(
+        mediaId: mediaId,
+        onChoose: (choice) => Navigator.of(context).pop(choice),
+      ),
+    ),
+  );
+  if (choice == null || !context.mounted) return;
+  await choice(context);
+}
+
+/// What a More-menu row does once the menu has closed.
+typedef PlayerMenuChoice = Future<void> Function(BuildContext context);
+
+class PlayerMoreMenuPanel extends ConsumerWidget {
+  const PlayerMoreMenuPanel({
+    required this.mediaId,
+    required this.onChoose,
+    super.key,
+  });
+
+  final String mediaId;
+  final ValueChanged<PlayerMenuChoice> onChoose;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = EnjoyThemeTokens.of(context);
+    final l10n = AppLocalizations.of(context)!;
+    final actions = watchTranscriptActions(ref, l10n, mediaId);
+    final exportAvailable =
+        ref.watch(loopClipExportAvailableProvider(mediaId)).valueOrNull ??
+        false;
+    return Semantics(
+      container: true,
+      explicitChildNodes: true,
+      label: l10n.playerMore,
+      child: Material(
+        type: MaterialType.transparency,
+        child: Container(
+          width: _menuWidth,
+          padding: const EdgeInsets.all(6),
+          decoration: ShapeDecoration(
+            color: t.raised,
+            shape: RoundedSuperellipseBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: BorderSide(color: t.line),
+            ),
+            shadows: t.shadowFloat,
+          ),
+          child: FocusTraversalGroup(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                  child: EnjoyOverline(l10n.playerMoreTranscriptSection),
+                ),
+                for (final (i, action) in actions.indexed)
+                  PlayerMenuRow(
+                    key: action.key,
+                    label: action.label,
+                    autofocus: i == 0,
+                    onTap: () => onChoose(action.run),
+                  ),
+                const _MenuDivider(),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                  child: EnjoyOverline(l10n.playerMoreMediaSection),
+                ),
+                PlayerMenuRow(
+                  key: const ValueKey('player-more-edit-details'),
+                  label: l10n.playerMoreEditDetails,
+                  onTap: () => onChoose(
+                    (context) => editMediaDetailsForId(context, ref, mediaId),
+                  ),
+                ),
+                PlayerMenuRow(
+                  key: const ValueKey('player-more-export-loop-clip'),
+                  label: l10n.playerMoreExportLoopClip,
+                  enabled: exportAvailable,
+                  onTap: () => onChoose(
+                    (context) => exportLoopAsClip(context, ref, mediaId),
+                  ),
+                ),
+                const _MenuDivider(),
+                PlayerMenuRow(
+                  key: const ValueKey('player-more-shortcuts'),
+                  label: l10n.playerMoreKeyboardShortcuts,
+                  trailing: const EnjoyKeycap(label: '?'),
+                  onTap: () => onChoose(showHotkeysHelpDialog),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class PlayerMenuRow extends StatelessWidget {
+  const PlayerMenuRow({
+    required this.label,
+    required this.onTap,
+    this.trailing,
+    this.autofocus = false,
+    this.enabled = true,
+    super.key,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final Widget? trailing;
+  final bool autofocus;
+
+  /// Disabled rows render dimmed and cannot be pressed or focused — the
+  /// "Export the loop as a clip…" entry while no exportable Echo loop is
+  /// active.
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = EnjoyThemeTokens.of(context);
+    return EnjoyPressable(
+      onTap: enabled ? onTap : null,
+      autofocus: autofocus,
+      borderRadius: BorderRadius.circular(10),
+      pressedScale: 1,
+      washColor: t.sunk,
+      semanticsLabel: label,
+      child: SizedBox(
+        height: 40,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Opacity(
+            opacity: enabled ? 1 : 0.45,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontSize: 14,
+                      color: t.ink,
+                    ),
+                  ),
+                ),
+                ?trailing,
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MenuDivider extends StatelessWidget {
+  const _MenuDivider();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = EnjoyThemeTokens.of(context);
+    return Container(
+      height: 1,
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      color: t.line,
+    );
+  }
+}
+
+/// Fire-and-forget [showPlayerMoreMenu] for tap handlers.
+void openPlayerMoreMenu(BuildContext context, String mediaId) =>
+    unawaited(showPlayerMoreMenu(context, mediaId));

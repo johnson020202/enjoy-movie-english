@@ -1,0 +1,290 @@
+import 'package:drift/native.dart';
+import 'package:enjoy_player/data/db/app_database.dart';
+import 'package:enjoy_player/data/db/media_registry.dart';
+import 'package:enjoy_player/features/library/domain/media.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+VideoRow _video({
+  String id = 'v-1',
+  String vid = 'vid-1',
+  String provider = 'user',
+  String title = 'Sample',
+  String? description,
+  String? thumbnailUrl,
+  int durationSeconds = 60,
+  String language = 'und',
+  String? source,
+  String? localUri,
+  String? md5,
+  int? size,
+  int? localMtimeMs,
+  String? mediaUrl,
+  DateTime? createdAt,
+  DateTime? updatedAt,
+}) {
+  final now = DateTime.utc(2026, 7, 1);
+  return VideoRow(
+    id: id,
+    vid: vid,
+    provider: provider,
+    title: title,
+    description: description,
+    thumbnailUrl: thumbnailUrl,
+    durationSeconds: durationSeconds,
+    language: language,
+    source: source,
+    localUri: localUri,
+    md5: md5,
+    size: size,
+    localMtimeMs: localMtimeMs,
+    mediaUrl: mediaUrl,
+    createdAt: createdAt ?? now,
+    updatedAt: updatedAt ?? now,
+  );
+}
+
+void main() {
+  late AppDatabase db;
+
+  setUp(() {
+    db = AppDatabase(executor: NativeDatabase.memory());
+  });
+
+  tearDown(() async {
+    await db.close();
+  });
+
+  group('VideoDao', () {
+    test('insertRow + getById round-trip', () async {
+      await db.videoDao.insertRow(_video(title: 'Hello'));
+      final found = await db.videoDao.getById('v-1');
+      expect(found, isNotNull);
+      expect(found!.title, 'Hello');
+      expect(found.vid, 'vid-1');
+      expect(found.provider, 'user');
+    });
+
+    test('getById returns null for unknown id', () async {
+      expect(await db.videoDao.getById('missing'), isNull);
+    });
+
+    test(
+      'getManyByIds returns a map keyed by id, missing ids omitted',
+      () async {
+        await db.videoDao.insertRow(_video(id: 'v-1'));
+        await db.videoDao.insertRow(_video(id: 'v-2', vid: 'vid-2'));
+        final found = await db.videoDao.getManyByIds(['v-2', 'nope', 'v-1']);
+        expect(found.keys.toSet(), {'v-1', 'v-2'});
+      },
+    );
+
+    test('getManyByIds with empty input returns an empty map', () async {
+      expect(await db.videoDao.getManyByIds([]), isEmpty);
+    });
+
+    test('upsertRows inserts new rows and replaces existing by id', () async {
+      await db.videoDao.insertRow(_video(id: 'v-1', title: 'old'));
+      await db.videoDao.upsertRows([
+        _video(id: 'v-1', title: 'new'),
+        _video(id: 'v-9', vid: 'vid-9', title: 'fresh'),
+      ]);
+      expect((await db.videoDao.getById('v-1'))!.title, 'new');
+      expect((await db.videoDao.getById('v-9'))!.title, 'fresh');
+    });
+
+    test('upsertRows with empty input is a no-op', () async {
+      await db.videoDao.upsertRows([]);
+      expect(await db.videoDao.getById('v-1'), isNull);
+    });
+
+    test('getYoutubeByVid filters by provider=youtube + vid', () async {
+      await db.videoDao.insertRow(
+        _video(id: 'yt-a', vid: 'YT-1', provider: 'youtube'),
+      );
+      await db.videoDao.insertRow(
+        _video(id: 'local-a', vid: 'YT-1', provider: 'user'),
+      );
+
+      final yt = await db.videoDao.getYoutubeByVid('YT-1');
+      expect(yt, isNotNull);
+      expect(yt!.id, 'yt-a');
+
+      expect(await db.videoDao.getYoutubeByVid('NOPE'), isNull);
+    });
+
+    test('listAll returns every row', () async {
+      await db.videoDao.insertRow(_video(id: 'a'));
+      await db.videoDao.insertRow(_video(id: 'b'));
+      final all = await db.videoDao.listAll();
+      expect(all.map((r) => r.id).toSet(), {'a', 'b'});
+    });
+
+    test('watchAll orders by createdAt descending', () async {
+      final base = DateTime.utc(2026, 7, 1);
+      await db.videoDao.insertRow(
+        _video(id: 'old', createdAt: base, updatedAt: base),
+      );
+      await db.videoDao.insertRow(
+        _video(
+          id: 'new',
+          createdAt: base.add(const Duration(days: 1)),
+          updatedAt: base.add(const Duration(days: 1)),
+        ),
+      );
+      final list = await db.videoDao.watchAll().first;
+      expect(list.first.id, 'new');
+      expect(list.last.id, 'old');
+    });
+
+    test('watchAll projects every field Media needs', () async {
+      final when = DateTime.utc(2026, 7, 1);
+      await db.videoDao.insertRow(
+        _video(
+          id: 'v-full',
+          vid: 'vid-full',
+          provider: 'youtube',
+          title: 'Full row',
+          thumbnailUrl: '/tmp/thumb.jpg',
+          durationSeconds: 91,
+          language: 'ja',
+          source: 'Some channel',
+          localUri: 'file:///tmp/v.mp4',
+          size: 42,
+          mediaUrl: 'https://example.com/v',
+          createdAt: when,
+          updatedAt: when,
+        ),
+      );
+
+      final rows = await db.videoDao.watchAll().first;
+      final media = mediaFromLibraryProjection(
+        rows.single,
+        kind: MediaKind.video,
+      );
+
+      expect(media.id, 'v-full');
+      expect(media.kind, MediaKind.video);
+      expect(media.title, 'Full row');
+      expect(media.sourceUri, 'file:///tmp/v.mp4');
+      expect(media.thumbnailPath, '/tmp/thumb.jpg');
+      expect(media.durationMs, 91000);
+      expect(media.language, 'ja');
+      expect(media.contentHash, 'vid-full');
+      expect(media.fileSize, 42);
+      expect(media.mediaUrl, 'https://example.com/v');
+      expect(media.source, 'Some channel');
+      expect(media.provider, 'youtube');
+      expect(media.syncStatus, isNull);
+      expect(media.createdAt.toUtc(), when);
+      expect(media.updatedAt.toUtc(), when);
+    });
+
+    test('watchRecentByUpdatedAt returns top rows by updatedAt desc', () async {
+      final base = DateTime.utc(2026, 7, 1);
+      await db.videoDao.insertRow(
+        _video(
+          id: 'stale',
+          createdAt: base,
+          updatedAt: base.add(const Duration(days: 1)),
+        ),
+      );
+      await db.videoDao.insertRow(
+        _video(
+          id: 'freshest',
+          createdAt: base,
+          updatedAt: base.add(const Duration(days: 3)),
+        ),
+      );
+      await db.videoDao.insertRow(
+        _video(
+          id: 'middling',
+          createdAt: base,
+          updatedAt: base.add(const Duration(days: 2)),
+        ),
+      );
+
+      final top2 = await db.videoDao.watchRecentByUpdatedAt(2).first;
+      expect(top2.map((r) => r.id).toList(), ['freshest', 'middling']);
+
+      final all = await db.videoDao.watchRecentByUpdatedAt(10).first;
+      expect(all.map((r) => r.id).toList(), ['freshest', 'middling', 'stale']);
+    });
+
+    test('insertRow with insertOrReplace overwrites by primary key', () async {
+      await db.videoDao.insertRow(_video(title: 'first'));
+      await db.videoDao.insertRow(_video(title: 'second'));
+      final found = await db.videoDao.getById('v-1');
+      expect(found!.title, 'second');
+    });
+
+    test('updateLocalThumbnail sets thumbnailUrl', () async {
+      await db.videoDao.insertRow(_video());
+      await db.videoDao.updateLocalThumbnail('v-1', '/tmp/a.jpg');
+      final found = await db.videoDao.getById('v-1');
+      expect(found!.thumbnailUrl, '/tmp/a.jpg');
+    });
+
+    test('updateYoutubeMetadata sets title and thumbnail', () async {
+      await db.videoDao.insertRow(_video(title: 'old'));
+      await db.videoDao.updateYoutubeMetadata(
+        id: 'v-1',
+        title: 'new',
+        thumbnailUrl: 'http://t',
+      );
+      final found = await db.videoDao.getById('v-1');
+      expect(found!.title, 'new');
+      expect(found.thumbnailUrl, 'http://t');
+    });
+
+    test(
+      'updateYoutubeMetadata accepts null thumbnail (Value.absent)',
+      () async {
+        await db.videoDao.insertRow(_video(thumbnailUrl: 'http://old'));
+        await db.videoDao.updateYoutubeMetadata(
+          id: 'v-1',
+          title: 'new',
+          thumbnailUrl: null,
+        );
+        final found = await db.videoDao.getById('v-1');
+        expect(found!.title, 'new');
+        expect(found.thumbnailUrl, 'http://old');
+      },
+    );
+
+    test('updateLanguage changes language column', () async {
+      await db.videoDao.insertRow(_video(language: 'en'));
+      await db.videoDao.updateLanguage(id: 'v-1', language: 'zh');
+      final found = await db.videoDao.getById('v-1');
+      expect(found!.language, 'zh');
+    });
+
+    test('touchUpdatedAt bumps updatedAt', () async {
+      final base = DateTime.utc(2026, 1, 1);
+      await db.videoDao.insertRow(_video(createdAt: base, updatedAt: base));
+      await db.videoDao.touchUpdatedAt('v-1');
+      final found = await db.videoDao.getById('v-1');
+      expect(found!.updatedAt.toUtc().isAfter(base), isTrue);
+      expect(found.createdAt.toUtc(), base);
+    });
+
+    test('deleteId removes the row', () async {
+      await db.videoDao.insertRow(_video());
+      await db.videoDao.deleteId('v-1');
+      expect(await db.videoDao.getById('v-1'), isNull);
+    });
+
+    test('existsByLocalUri returns true for matching rows', () async {
+      await db.videoDao.insertRow(_video(id: 'a', localUri: '/tmp/a.mp4'));
+      await db.videoDao.insertRow(_video(id: 'b', localUri: '/tmp/a.mp4'));
+      await db.videoDao.insertRow(_video(id: 'c', localUri: '/tmp/b.mp4'));
+      expect(await db.videoDao.existsByLocalUri('/tmp/a.mp4'), isTrue);
+      expect(await db.videoDao.existsByLocalUri('/tmp/b.mp4'), isTrue);
+      expect(await db.videoDao.existsByLocalUri('/tmp/missing'), isFalse);
+    });
+
+    test('existsByLocalUri returns false for null localUri rows', () async {
+      await db.videoDao.insertRow(_video(id: 'a'));
+      expect(await db.videoDao.existsByLocalUri('/tmp/a.mp4'), isFalse);
+    });
+  });
+}
