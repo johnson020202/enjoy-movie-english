@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "build": 1,
+  "minSupportedVersion": "1.0.0",
+  "notes": "首个可安装版本：无需账号、本地优先，AI 走自备密钥。",
+  "assets": {
+    "android_arm64_v8a": {
+      "url": "https://github.com/johnson020202/enjoy-movie-english/releases/download/v1.0.0/EnjoyMovieEnglish-1.0.0-arm64-v8a.apk",
+      "sha256": "9f392b6fed1d58ea9e23682de91eefb8789c75faf9ecc81a7cb62b48d9fa81ab",
+      "file": "EnjoyMovieEnglish-1.0.0-arm64-v8a.apk"
+    }
+  }
+}
