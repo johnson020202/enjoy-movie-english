@@ -57,6 +57,15 @@ part 'app_router.g.dart';
 final GlobalKey<NavigatorState> enjoyShellNavigatorKey =
     GlobalKey<NavigatorState>(debugLabel: 'shell');
 
+/// The router's top-level navigator.
+///
+/// Hosts mounted above the router — [UpdatePromptHost] lives in
+/// `MaterialApp.builder` — cannot reach a Navigator through their own widget
+/// context, because that context sits above the Navigator the router creates.
+/// They use this key instead of `Navigator.of(context)`, which throws.
+final GlobalKey<NavigatorState> enjoyRootNavigatorKey =
+    GlobalKey<NavigatorState>(debugLabel: 'root');
+
 CustomTransitionPage<void> _shellPage({
   required LocalKey key,
   required Widget child,
@@ -108,6 +117,7 @@ GoRouter appRouter(Ref ref) {
   );
   final router = GoRouter(
     initialLocation: '/',
+    navigatorKey: enjoyRootNavigatorKey,
     refreshListenable: authTick,
     observers: [rootOverlayObserver, rootScreenObserver],
     errorBuilder: (context, state) => NotFoundScreen(uri: state.uri),

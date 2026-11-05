@@ -8,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:enjoy_player/core/notices/app_notice.dart';
 import 'package:enjoy_player/core/release/distribution_channel.dart';
+import 'package:enjoy_player/core/routing/app_router.dart';
 import 'package:enjoy_player/features/player/application/player_state_providers.dart';
 import 'package:enjoy_player/features/update/application/update_controller.dart';
 import 'package:enjoy_player/features/update/domain/update_types.dart';
@@ -55,11 +56,25 @@ class _UpdatePromptHostState extends ConsumerState<UpdatePromptHost> {
     if (release == null || !mounted) return;
     _showingPrompt = true;
     try {
-      await _showPrompt(context, ref, release);
+      final dialogContext = _dialogContext(context);
+      if (dialogContext != null) {
+        await _showPrompt(dialogContext, ref, release);
+      }
     } finally {
       _showingPrompt = false;
     }
   }
+}
+
+/// A context that can host a dialog.
+///
+/// This host is mounted in `MaterialApp.builder`, whose context sits *above*
+/// the router's Navigator — `Navigator.of` there throws
+/// (`Null check operator used on a null value`) and the prompt never appears.
+/// Fall back to the root navigator's own context, which is inside it.
+BuildContext? _dialogContext(BuildContext fallback) {
+  if (Navigator.maybeOf(fallback) != null) return fallback;
+  return enjoyRootNavigatorKey.currentContext;
 }
 
 Future<void> _showPrompt(
